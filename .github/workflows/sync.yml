@@ -1,27 +1,28 @@
 name: StoryGraph to Notion Sync
 on:
-  schedule:
-    - cron: '0 9 * * *' # Automatically runs daily at 9:00 AM
-  workflow_dispatch: # Allows you to click "Run workflow" manually whenever you want
+  workflow_dispatch:
 
 jobs:
-  sync:
+  test_sync:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Set Up Python Engine
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
-
-      - name: Execute Live Sync Data
+      - name: Force Test Book Into Notion
         env:
           NOTION_API_KEY: ${{ secrets.NOTION_API_KEY }}
           NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
-          USERNAME: ${{ secrets.USERNAME }}
         run: |
-          pip install requests beautifulsoup4
-          curl -sS https://githubusercontent.com > sync.py
-          python sync.py
+          curl -X POST "https://notion.com" \
+            -H "Authorization: Bearer $NOTION_API_KEY" \
+            -H "Content-Type: application/json" \
+            -H "Notion-Version: 2022-06-28" \
+            --data '{
+              "parent": {"database_id": "'"$NOTION_DATABASE_ID"'"},
+              "properties": {
+                "Name": {"title": [{"text": {"content": "Automation Test Complete! 🎉"}}]},
+                "Cover Image": {"url": "https://unsplash.com"}
+              }
+            }'
+          print("Direct payload sent successfully!")
