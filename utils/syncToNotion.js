@@ -1,103 +1,118 @@
-import { Client } from '@notionhq/client';
+import { Client } from "@notionhq/client";
+import * as scraper from "../functions/getList.js";
 
-// In the original repo, this file might have a different name or path
-// Let's try to find the right module by importing it differently
-import * as scraper from '../functions/getList.js';
-
-// Initialize Notion client
-const notion = new Client({ auth: process.env.NOTION_API_KEY });
+const notion = new Client({
+  auth: process.env.NOTION_API_KEY,
+});
 const databaseId = process.env.NOTION_DATABASE_ID;
 const username = process.env.USERNAME;
 
 /**
  * Adds or updates a book in the Notion database
- * 
- * @param {Object} book - The book object from StoryGraph
- * @param {string} listType - One of "books-read", "currently-reading", or "to-read"
  */
 async function addBookToNotion(book, listType) {
+  if (!book || !book.title || book.title === "Untitled Book") {
+    console.log("Skipping entry with missing title...");
+    return;
+  }
+
   try {
-    // Check if book already exists in database
+    // Determine filter method: Use StoryGraph ID if present, otherwise fall back to Title
+    const filterQuery = book.id
+      ? {
+          property: "StoryGraph ID",
+          rich_text: {
+            equals: String(book.id),
+          },
+        }
+      : {
+          property: "Title",
+          title: {
+            equals: book.title,
+          },
+        };
+
     const response = await notion.databases.query({
       database_id: databaseId,
-      filter: {
-        property: "StoryGraph ID",
-        rich_text: {
-          equals: book.id
-        }
-      }
+      filter: filterQuery,
     });
 
     const bookProperties = {
-      "Title": {
+      Title: {
         title: [
           {
             text: {
-              content: book.title
-            }
-          }
-        ]
+              content: book.title,
+            },
+          },
+        ],
       },
-      "Author": {
+      Author: {
         rich_text: [
           {
             text: {
-              content: book.author || "Unknown"
-            }
-          }
-        ]
+              content: book.author || "Unknown",
+            },
+          },
+        ],
       },
-      "StoryGraph ID": {
-        rich_text: [
-          {
-            text: {
-              content: book.id
-            }
+      "StoryGraph ID": book.id
+        ? {
+            rich_text: [
+              {
+                text: {
+                  content: String(book.id),
+                },
+              },
+            ],
           }
-        ]
-      },
-      "Status": {
+        : undefined,
+      Status: {
         select: {
-          name: listTypeToStatus(listType)
-        }
+          name: listTypeToStatus(listType),
+        },
       },
-      "Page Count": book.pageCount ? {
-        number: book.pageCount
-      } : undefined,
-      "First Published": book.firstPublished ? {
-        number: book.firstPublished
-      } : undefined,
-      "Cover Image": book.bookCoverStoryGraphUrl ? {
-        url: book.bookCoverStoryGraphUrl
-      } : undefined,
-      "Genres": {
-        multi_select: book.genreTags ? 
-          book.genreTags.map(tag => ({ name: tag })).slice(0, 10) : []
+      "Cover Image":
+        book.cover || book.bookCoverStoryGraphUrl
+          ? {
+              url: book.cover || book.bookCoverStoryGraphUrl,
+            }
+          : undefined,
+      "Page Count": book.pageCount
+        ? {
+            number: Number(book.pageCount),
+          }
+        : undefined,
+      Genres: {
+        multi_select: book.genreTags
+          ? book.genreTags.map((tag) => ({ name: tag })).slice(0, 10)
+          : [],
       },
-      "Moods": {
-        multi_select: book.moodTags ? 
-          book.moodTags.map(tag => ({ name: tag })).slice(0, 10) : []
-      }
+      Moods: {
+        multi_select: book.moodTags
+          ? book.moodTags.map((tag) => ({ name: tag })).slice(0, 10)
+          : [],
+      },
     };
 
-    // Remove undefined properties
-    Object.keys(bookProperties).forEach(key => 
-      bookProperties[key] === undefined && delete bookProperties[key]
+    // Clean up undefined properties before sending to API
+    Object.keys(bookProperties).forEach(
+      (key) => bookProperties[key] === undefined && delete bookProperties[key]
     );
 
     if (response.results.length > 0) {
-      // Update existing entry
+      // Update existing record
       const pageId = response.results[0].id;
       await notion.pages.update({
         page_id: pageId,
-        properties: bookProperties
+        properties: bookProperties,
       });
       console.log(`Updated book: ${book.title}`);
     } else {
-      // Create new entry
+      // Create new page entry
       await notion.pages.create({
         parent: { database_id: databaseId },
-        properties: bookProperties
+        properties: bookProperties,
       });
       console.log(`Added new book: ${book.title}`);
     }
@@ -106,38 +121,29 @@ async function addBookToNotion(book, listType) {
   }
 }
 
-/**
- * Converts StoryGraph list type to a status value for Notion
- */
 function listTypeToStatus(listType) {
-  switch(listType) {
-    case 'books-read':
-      return 'Read';
-    case 'currently-reading':
-      return 'Reading';
-    case 'to-read':
-      return 'Want to Read';
+  switch (listType) {
+    case "books-read":
+      return "Read";
+    case "currently-reading":
+      return "Reading";
+    case "to-read":
+      return "Want to Read";
     default:
-      return 'Unknown';
+      return "Unknown";
   }
 }
 
-/**
- * Scrapes StoryGraph list using the getList function
- */
 async function scrapeStoryGraphList({ target, username, limit }) {
   try {
-    // This is a workaround since we can't directly import scrapeStoryGraph
-    // We're using the getList function directly from the functions directory
     const result = await scraper.handler({
       queryStringParameters: {
         target,
         username,
-        limit
-      }
+        limit,
+      },
     });
-    
-    // The handler returns a response object, we need to parse the body
+
     return JSON.parse(result.body);
   } catch (error) {
     console.error(`Error scraping list ${target}:`, error);
@@ -145,36 +151,28 @@ async function scrapeStoryGraphList({ target, username, limit }) {
   }
 }
 
-/**
- * Syncs all StoryGraph lists to Notion
- */
 async function syncAllToNotion() {
   try {
-    console.log('Starting sync to Notion...');
-    
-    // Get all lists from StoryGraph
-    const listTypes = ['books-read', 'currently-reading', 'to-read'];
-    
+    console.log("Starting sync to Notion...");
+
+    const listTypes = ["books-read", "currently-reading", "to-read"];
+
     for (const listType of listTypes) {
       console.log(`Fetching ${listType} list...`);
       const books = await scrapeStoryGraphList({ target: listType, username });
       console.log(`Found ${books.length} books in ${listType}`);
-      
-      // Add/update each book in Notion
+
       for (const book of books) {
         await addBookToNotion(book, listType);
       }
     }
-    
-    console.log('Sync to Notion completed!');
+
+    console.log("Sync to Notion completed!");
   } catch (error) {
-    console.error('Error syncing to Notion:', error);
+    console.error("Error syncing to Notion:", error);
   }
 }
 
-// Execute the sync if this file is run directly
-if (import.meta.url === import.meta.url) {
-  syncAllToNotion();
-}
+syncAllToNotion();
 
 export { syncAllToNotion, addBookToNotion };
