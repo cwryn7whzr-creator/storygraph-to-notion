@@ -7,9 +7,8 @@ const notion = new Client({
 const databaseId = process.env.NOTION_DATABASE_ID;
 const username = process.env.USERNAME;
 
-/**
- * Adds or updates a book in the Notion database
- */
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
 async function addBookToNotion(book, listType) {
   if (!book || !book.title || book.title === "Untitled Book") {
     console.log("Skipping entry with missing title...");
@@ -17,7 +16,6 @@ async function addBookToNotion(book, listType) {
   }
 
   try {
-    // Determine filter method: Use StoryGraph ID if present, otherwise fall back to Title
     const filterQuery = book.id
       ? {
           property: "StoryGraph ID",
@@ -95,13 +93,11 @@ async function addBookToNotion(book, listType) {
       },
     };
 
-    // Clean up undefined properties before sending to API
     Object.keys(bookProperties).forEach(
       (key) => bookProperties[key] === undefined && delete bookProperties[key]
     );
 
     if (response.results.length > 0) {
-      // Update existing record
       const pageId = response.results[0].id;
       await notion.pages.update({
         page_id: pageId,
@@ -109,7 +105,6 @@ async function addBookToNotion(book, listType) {
       });
       console.log(`Updated book: ${book.title}`);
     } else {
-      // Create new page entry
       await notion.pages.create({
         parent: { database_id: databaseId },
         properties: bookProperties,
@@ -117,6 +112,11 @@ async function addBookToNotion(book, listType) {
       console.log(`Added new book: ${book.title}`);
     }
   } catch (error) {
+    if (error.status === 429) {
+      console.warn(`Rate limited on "${book.title}". Retrying in 3 seconds...`);
+      await delay(3000);
+      return addBookToNotion(book, listType);
+    }
     console.error(`Error adding book ${book.title} to Notion:`, error);
   }
 }
@@ -164,6 +164,7 @@ async function syncAllToNotion() {
 
       for (const book of books) {
         await addBookToNotion(book, listType);
+        await delay(350);
       }
     }
 
