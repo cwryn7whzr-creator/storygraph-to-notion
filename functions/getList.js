@@ -1,5 +1,6 @@
 import "dotenv/config";
 import { chromium } from "playwright";
+import * as cheerio from "cheerio";
 import parseBookPane from "../utils/parseBookPane.js";
 
 const USERNAME = process.env.USERNAME;
@@ -8,7 +9,7 @@ const createStorygraphUrl = (target, username, page = 1) =>
   `https://app.thestorygraph.com/${target}/${username}?page=${page}`;
 
 /**
- * Fetch book pane outerHTML strings using Playwright directly.
+ * Fetch book pane outerHTML strings using Playwright and wait for elements to render.
  */
 const fetchBookPaneHtmls = async (browser, url) => {
   const context = await browser.newContext({
@@ -17,10 +18,13 @@ const fetchBookPaneHtmls = async (browser, url) => {
   });
   const page = await context.newPage();
 
-  // Navigate to the URL and wait until DOM is loaded
   await page.goto(url, { waitUntil: "domcontentloaded" });
 
-  // Extract outer HTML for all .book-pane elements straight from the browser
+  // Wait up to 5 seconds for book panes to dynamically render on the page
+  await page.waitForSelector(".book-pane", { timeout: 5000 }).catch(() => {
+    console.log(`No .book-pane elements rendered at ${url}`);
+  });
+
   const paneHtmls = await page.$$eval(".book-pane", (elements) =>
     elements.map((el) => el.outerHTML)
   );
@@ -29,6 +33,9 @@ const fetchBookPaneHtmls = async (browser, url) => {
   return paneHtmls;
 };
 
+/**
+ * Fetch and parse all book panes across multiple pages for a target list.
+ */
 const fetchAllBookPanes = async (target, username, limit = Infinity) => {
   let pageNum = 1;
   let hasMorePages = true;
@@ -42,7 +49,9 @@ const fetchAllBookPanes = async (target, username, limit = Infinity) => {
       const paneHtmls = await fetchBookPaneHtmls(browser, url);
 
       for (let i = 0; i <= limit - 1 && i < paneHtmls.length; i++) {
-        allBookPanes.push(paneHtmls[i]);
+        // Load the HTML string into Cheerio so $pane.find() works in parseBookPane
+        const $ = cheerio.load(paneHtmls[i]);
+        allBookPanes.push($.root());
       }
 
       hasMorePages = paneHtmls.length >= 10;
