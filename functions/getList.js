@@ -37,8 +37,8 @@ const fetchAllBookPanes = async (target, username, limit = Infinity) => {
         .waitForSelector(".book-pane, .book-title-author-and-series", { timeout: 10000 })
         .catch(() => {});
 
-      // Scroll down to trigger any lazy-loaded image/card rendering
-      await page.evaluate(() => window.scrollBy(0, 800));
+      // Scroll down to the bottom where pagination controls sit
+      await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
       await page.waitForTimeout(1000);
 
       // Extract current page's HTML book cards
@@ -66,21 +66,35 @@ const fetchAllBookPanes = async (target, username, limit = Infinity) => {
         }
       }
 
-      // Look for StoryGraph's real "Next" pagination link or button
-      const nextButton = await page.$("a[rel='next'], a:has-text('Next'), .pagination .next a");
+      // Comprehensive selector matching StoryGraph's pagination elements
+      const nextButton = await page.$(
+        ".pagination .next a, .pagination a[rel='next'], a.next_page, [aria-label*='next' i], .pagination a:has-text('›'), .pagination a:has-text('»'), .pagination a:has-text('>')"
+      );
 
       if (nextButton && allBookPanes.length < limit) {
+        // Verify the next button is active and not disabled
+        const isDisabled = await page.evaluate(
+          (el) => el.classList.contains("disabled") || el.getAttribute("aria-disabled") === "true",
+          nextButton
+        );
+
+        if (isDisabled) {
+          console.log(`[SCRAPER] Next button is disabled. Reached last page for ${target}.`);
+          hasNextPage = false;
+          break;
+        }
+
         pageCount++;
         console.log(`[SCRAPER] Clicking Next button for Page ${pageCount}...`);
-        
+
         await Promise.all([
           page.waitForResponse((resp) => resp.status() === 200, { timeout: 10000 }).catch(() => {}),
           nextButton.click(),
         ]);
-        
-        await page.waitForTimeout(2000); // Allow Turbo stream to attach new items to DOM
+
+        await page.waitForTimeout(2000); // Allow Turbo response to stream into DOM
       } else {
-        console.log(`[SCRAPER] No further 'Next' page button found. Finished scraping ${target}.`);
+        console.log(`[SCRAPER] No active 'Next' button found. Finished scraping ${target}.`);
         hasNextPage = false;
       }
     }
