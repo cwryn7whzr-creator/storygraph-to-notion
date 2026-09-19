@@ -3,32 +3,59 @@ import { chromium } from "playwright";
 import * as cheerio from "cheerio";
 import parseBookPane from "../utils/parseBookPane.js";
 
-const USERNAME = process.env.USERNAME;
+const USERNAME = process.env.USERNAME || "seaw457";
 
 const createStorygraphUrl = (target, username, page = 1) =>
   `https://app.thestorygraph.com/${target}/${username}?page=${page}`;
 
 const fetchBookPaneHtmls = async (browser, url) => {
   const context = await browser.newContext({
+    viewport: { width: 1280, height: 800 },
     userAgent:
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
   });
   const page = await context.newPage();
 
   try {
+    // Navigate to URL
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
-    // Allow up to 10 seconds for dynamic cards to render
-    await page.waitForSelector(".book-pane", { timeout: 10000 });
+
+    // Scroll down iteratively to trigger StoryGraph's lazy-loading
+    await page.evaluate(async () => {
+      await new Promise((resolve) => {
+        let totalHeight = 0;
+        const distance = 400;
+        const timer = setInterval(() => {
+          const scrollHeight = document.body.scrollHeight;
+          window.scrollBy(0, distance);
+          totalHeight += distance;
+
+          if (totalHeight >= scrollHeight || totalHeight > 3000) {
+            clearInterval(timer);
+            resolve();
+          }
+        }, 150);
+      });
+    });
+
+    // Wait up to 10 seconds for book card containers to exist in the DOM
+    await page
+      .waitForSelector(".book-pane, .book-title-author-and-series", { timeout: 10000 })
+      .catch(() => {});
+
+    await page.waitForTimeout(1000);
   } catch (err) {
-    console.log(`No .book-pane elements rendered at ${url}`);
+    console.log(`Navigation note for ${url}: ${err.message}`);
   }
 
-  const paneHtmls = await page.$$eval(".book-pane", (elements) =>
-    elements.map((el) => el.outerHTML)
+  // Extract outerHTML for all book pane elements
+  const paneHtmls = await page.$$eval(
+    ".book-pane, .book-title-author-and-series",
+    (elements) => elements.map((el) => el.closest(".book-pane")?.outerHTML || el.outerHTML)
   );
 
   await context.close();
-  return paneHtmls;
+  return paneHtmls.filter(Boolean);
 };
 
 const fetchAllBookPanes = async (target, username, limit = Infinity) => {
@@ -53,7 +80,6 @@ const fetchAllBookPanes = async (target, username, limit = Infinity) => {
         allBookPanes.push($.root());
       }
 
-      // If page returned 10 items, continue to next page; otherwise stop
       hasMorePages = paneHtmls.length >= 10;
       pageNum++;
 
