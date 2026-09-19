@@ -8,8 +8,8 @@
   },
   "dependencies": {
     "@notionhq/client": "^2.2.15",
+    "cheerio": "^1.0.0-rc.12",
     "dotenv": "^16.4.5",
-    "happy-dom": "^13.10.1",
     "playwright": "^1.42.1"
   }
 }
