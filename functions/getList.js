@@ -5,60 +5,30 @@ import parseBookPane from "../utils/parseBookPane.js";
 
 const USERNAME = process.env.USERNAME || "seaw457";
 
-const createStorygraphUrl = (target, username, page = 1) => {
-  let path = target;
-  // Map 'books-read' to StoryGraph's actual endpoint for finished books
-  if (target === "books-read") {
-    path = "currently-read";
-  }
-  return `https://app.thestorygraph.com/${path}/${username}?page=${page}`;
-};
+const createStorygraphUrl = (target, username, page = 1) =>
+  `https://app.thestorygraph.com/${target}/${username}?page=${page}`;
 
 const fetchBookPaneHtmls = async (browser, url) => {
   const context = await browser.newContext({
     viewport: { width: 1280, height: 800 },
     userAgent:
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
   });
   const page = await context.newPage();
 
   try {
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
-
-    // Scroll to trigger lazy loading
-    await page.evaluate(async () => {
-      await new Promise((resolve) => {
-        let totalHeight = 0;
-        const distance = 400;
-        const timer = setInterval(() => {
-          const scrollHeight = document.body.scrollHeight;
-          window.scrollBy(0, distance);
-          totalHeight += distance;
-
-          if (totalHeight >= scrollHeight || totalHeight > 3000) {
-            clearInterval(timer);
-            resolve();
-          }
-        }, 150);
-      });
-    });
-
-    await page
-      .waitForSelector(".book-pane, .book-title-author-and-series", { timeout: 10000 })
-      .catch(() => {});
-
-    await page.waitForTimeout(1000);
+    await page.waitForSelector(".book-pane", { timeout: 10000 });
   } catch (err) {
-    console.log(`Navigation note for ${url}: ${err.message}`);
+    console.log(`No .book-pane elements rendered at ${url}`);
   }
 
-  const paneHtmls = await page.$$eval(
-    ".book-pane, .book-title-author-and-series",
-    (elements) => elements.map((el) => el.closest(".book-pane")?.outerHTML || el.outerHTML)
+  const paneHtmls = await page.$$eval(".book-pane", (elements) =>
+    elements.map((el) => el.outerHTML)
   );
 
   await context.close();
-  return paneHtmls.filter(Boolean);
+  return paneHtmls;
 };
 
 const fetchAllBookPanes = async (target, username, limit = Infinity) => {
