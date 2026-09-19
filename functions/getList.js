@@ -8,9 +8,6 @@ const USERNAME = process.env.USERNAME;
 const createStorygraphUrl = (target, username, page = 1) =>
   `https://app.thestorygraph.com/${target}/${username}?page=${page}`;
 
-/**
- * Fetch book pane outerHTML strings using Playwright and wait for elements to render.
- */
 const fetchBookPaneHtmls = async (browser, url) => {
   const context = await browser.newContext({
     userAgent:
@@ -18,12 +15,13 @@ const fetchBookPaneHtmls = async (browser, url) => {
   });
   const page = await context.newPage();
 
-  await page.goto(url, { waitUntil: "domcontentloaded" });
-
-  // Wait up to 5 seconds for book panes to dynamically render on the page
-  await page.waitForSelector(".book-pane", { timeout: 5000 }).catch(() => {
+  try {
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+    // Allow up to 10 seconds for dynamic cards to render
+    await page.waitForSelector(".book-pane", { timeout: 10000 });
+  } catch (err) {
     console.log(`No .book-pane elements rendered at ${url}`);
-  });
+  }
 
   const paneHtmls = await page.$$eval(".book-pane", (elements) =>
     elements.map((el) => el.outerHTML)
@@ -33,9 +31,6 @@ const fetchBookPaneHtmls = async (browser, url) => {
   return paneHtmls;
 };
 
-/**
- * Fetch and parse all book panes across multiple pages for a target list.
- */
 const fetchAllBookPanes = async (target, username, limit = Infinity) => {
   let pageNum = 1;
   let hasMorePages = true;
@@ -48,15 +43,21 @@ const fetchAllBookPanes = async (target, username, limit = Infinity) => {
       const url = createStorygraphUrl(target, username, pageNum);
       const paneHtmls = await fetchBookPaneHtmls(browser, url);
 
-      for (let i = 0; i <= limit - 1 && i < paneHtmls.length; i++) {
-        // Load the HTML string into Cheerio so $pane.find() works in parseBookPane
+      if (paneHtmls.length === 0) {
+        hasMorePages = false;
+        break;
+      }
+
+      for (let i = 0; i < paneHtmls.length && allBookPanes.length < limit; i++) {
         const $ = cheerio.load(paneHtmls[i]);
         allBookPanes.push($.root());
       }
 
+      // If page returned 10 items, continue to next page; otherwise stop
       hasMorePages = paneHtmls.length >= 10;
       pageNum++;
-      if (pageNum >= 5 || allBookPanes.length >= limit) {
+
+      if (pageNum > 10 || allBookPanes.length >= limit) {
         hasMorePages = false;
       }
     }
@@ -64,7 +65,7 @@ const fetchAllBookPanes = async (target, username, limit = Infinity) => {
     await browser.close();
   }
 
-  return allBookPanes.filter((pane) => pane != null);
+  return allBookPanes;
 };
 
 export const handler = async (req) => {
