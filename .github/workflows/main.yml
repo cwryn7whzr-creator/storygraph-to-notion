@@ -9,7 +9,6 @@ on:
   schedule:
     - cron: '0 9 * * *'
 
-
 jobs:
   deploy:
     runs-on: ubuntu-latest
@@ -36,7 +35,6 @@ jobs:
       run: find . -type f -not -path "*/node_modules/*" -not -path "*/.git/*" | sort
       
     - name: Sync data to Notion
-      if: github.ref == 'refs/heads/main' || github.event_name == 'schedule'
       run: node utils/syncToNotion.js
       env:
         USERNAME: ${{ secrets.USERNAME }}
