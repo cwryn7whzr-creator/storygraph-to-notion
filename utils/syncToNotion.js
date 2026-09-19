@@ -16,23 +16,15 @@ async function addBookToNotion(book, listType) {
   }
 
   try {
-    const filterQuery = book.id
-      ? {
-          property: "StoryGraph ID",
-          rich_text: {
-            equals: String(book.id),
-          },
-        }
-      : {
-          property: "Title",
-          title: {
-            equals: book.title,
-          },
-        };
-
+    // Search Notion database by Title
     const response = await notion.databases.query({
       database_id: databaseId,
-      filter: filterQuery,
+      filter: {
+        property: "Title",
+        title: {
+          equals: book.title,
+        },
+      },
     });
 
     const bookProperties = {
@@ -54,17 +46,6 @@ async function addBookToNotion(book, listType) {
           },
         ],
       },
-      "StoryGraph ID": book.id
-        ? {
-            rich_text: [
-              {
-                text: {
-                  content: String(book.id),
-                },
-              },
-            ],
-          }
-        : undefined,
       Status: {
         select: {
           name: listTypeToStatus(listType),
@@ -76,21 +57,6 @@ async function addBookToNotion(book, listType) {
               url: book.cover || book.bookCoverStoryGraphUrl,
             }
           : undefined,
-      "Page Count": book.pageCount
-        ? {
-            number: Number(book.pageCount),
-          }
-        : undefined,
-      Genres: {
-        multi_select: book.genreTags
-          ? book.genreTags.map((tag) => ({ name: tag })).slice(0, 10)
-          : [],
-      },
-      Moods: {
-        multi_select: book.moodTags
-          ? book.moodTags.map((tag) => ({ name: tag })).slice(0, 10)
-          : [],
-      },
     };
 
     Object.keys(bookProperties).forEach(
