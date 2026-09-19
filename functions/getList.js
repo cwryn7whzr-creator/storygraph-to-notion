@@ -5,8 +5,14 @@ import parseBookPane from "../utils/parseBookPane.js";
 
 const USERNAME = process.env.USERNAME || "seaw457";
 
-const createStorygraphUrl = (target, username, page = 1) =>
-  `https://app.thestorygraph.com/${target}/${username}?page=${page}`;
+const createStorygraphUrl = (target, username, page = 1) => {
+  let path = target;
+  // Map 'books-read' to StoryGraph's actual endpoint for finished books
+  if (target === "books-read") {
+    path = "currently-read";
+  }
+  return `https://app.thestorygraph.com/${path}/${username}?page=${page}`;
+};
 
 const fetchBookPaneHtmls = async (browser, url) => {
   const context = await browser.newContext({
@@ -17,10 +23,9 @@ const fetchBookPaneHtmls = async (browser, url) => {
   const page = await context.newPage();
 
   try {
-    // Navigate to URL
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
 
-    // Scroll down iteratively to trigger StoryGraph's lazy-loading
+    // Scroll to trigger lazy loading
     await page.evaluate(async () => {
       await new Promise((resolve) => {
         let totalHeight = 0;
@@ -38,7 +43,6 @@ const fetchBookPaneHtmls = async (browser, url) => {
       });
     });
 
-    // Wait up to 10 seconds for book card containers to exist in the DOM
     await page
       .waitForSelector(".book-pane, .book-title-author-and-series", { timeout: 10000 })
       .catch(() => {});
@@ -48,7 +52,6 @@ const fetchBookPaneHtmls = async (browser, url) => {
     console.log(`Navigation note for ${url}: ${err.message}`);
   }
 
-  // Extract outerHTML for all book pane elements
   const paneHtmls = await page.$$eval(
     ".book-pane, .book-title-author-and-series",
     (elements) => elements.map((el) => el.closest(".book-pane")?.outerHTML || el.outerHTML)
