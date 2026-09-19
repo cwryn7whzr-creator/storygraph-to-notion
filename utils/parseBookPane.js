@@ -1,23 +1,22 @@
-/**
- * Parse a book pane from StoryGraph HTML
- * @param {Object} $pane - The cheerio element representing the book pane
- * @returns {Object} The parsed book data
- */
 export default function parseBookPane($pane) {
-  // Basic implementation - replace with actual parsing logic if you have it
-  try {
-    const title = $pane.find('.book__title').text().trim();
-    const author = $pane.find('.book__author').text().trim();
-    const coverUrl = $pane.find('.book__cover img').attr('src');
-    
-    return {
-      title,
-      author,
-      coverUrl,
-      // Add other fields as required
-    };
-  } catch (error) {
-    console.error('Error parsing book pane:', error);
-    return null;
-  }
+  // Extract title using multiple common StoryGraph selectors
+  const title =
+    $pane.find(".book-title-author-and-series a").first().text().trim() ||
+    $pane.find("a[href*='/books/']").first().text().trim() ||
+    $pane.find(".title").text().trim() ||
+    "Untitled Book";
+
+  // Extract author
+  const author =
+    $pane.find("a[href*='/authors/']").first().text().trim() ||
+    $pane.find(".author").text().trim() ||
+    "Unknown Author";
+
+  // Extract cover image
+  const cover =
+    $pane.find("img.book-cover").attr("src") ||
+    $pane.find("img").attr("src") ||
+    "";
+
+  return { title, author, cover };
 }
