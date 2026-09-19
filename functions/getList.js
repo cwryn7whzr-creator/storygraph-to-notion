@@ -5,61 +5,87 @@ import parseBookPane from "../utils/parseBookPane.js";
 
 const USERNAME = process.env.USERNAME || "seaw457";
 
-const createStorygraphUrl = (target, username, page = 1) =>
-  `https://app.thestorygraph.com/${target}/${username}?page=${page}`;
+const createStorygraphUrl = (target, username) =>
+  `https://app.thestorygraph.com/${target}/${username}`;
 
-const fetchBookPaneHtmls = async (browser, url) => {
+const fetchAllBookPanes = async (target, username, limit = Infinity) => {
+  const allBookPanes = [];
+  const browser = await chromium.launch({
+    headless: true,
+    args: ["--no-sandbox", "--disable-setuid-sandbox"],
+  });
+
   const context = await browser.newContext({
-    viewport: { width: 1280, height: 800 },
+    viewport: { width: 1280, height: 1000 },
     userAgent:
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
   });
+
   const page = await context.newPage();
+  const url = createStorygraphUrl(target, username);
 
   try {
+    console.log(`[SCRAPER] Navigating to ${url}...`);
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
-    await page.waitForSelector(".book-pane", { timeout: 10000 });
-  } catch (err) {
-    console.log(`No .book-pane elements rendered at ${url}`);
-  }
 
-  const paneHtmls = await page.$$eval(".book-pane", (elements) =>
-    elements.map((el) => el.outerHTML)
-  );
+    let hasNextPage = true;
+    let pageCount = 1;
 
-  await context.close();
-  return paneHtmls;
-};
+    while (hasNextPage && allBookPanes.length < limit) {
+      // Wait for book cards to appear in the DOM
+      await page
+        .waitForSelector(".book-pane, .book-title-author-and-series", { timeout: 10000 })
+        .catch(() => {});
 
-const fetchAllBookPanes = async (target, username, limit = Infinity) => {
-  let pageNum = 1;
-  let hasMorePages = true;
-  const allBookPanes = [];
+      // Scroll down to trigger any lazy-loaded image/card rendering
+      await page.evaluate(() => window.scrollBy(0, 800));
+      await page.waitForTimeout(1000);
 
-  const browser = await chromium.launch({ headless: true });
+      // Extract current page's HTML book cards
+      const paneHtmls = await page.$$eval(
+        ".book-pane, .book-title-author-and-series",
+        (elements) =>
+          elements.map((el) => {
+            const card = el.closest(".book-pane") || el.closest(".search-results-item") || el;
+            return card.outerHTML;
+          })
+      );
 
-  try {
-    while (hasMorePages) {
-      const url = createStorygraphUrl(target, username, pageNum);
-      const paneHtmls = await fetchBookPaneHtmls(browser, url);
+      const uniquePanes = [...new Set(paneHtmls)].filter(Boolean);
+      console.log(`[SCRAPER] Page ${pageCount}: Found ${uniquePanes.length} books.`);
 
-      if (paneHtmls.length === 0) {
-        hasMorePages = false;
+      if (uniquePanes.length === 0) {
+        hasNextPage = false;
         break;
       }
 
-      for (let i = 0; i < paneHtmls.length && allBookPanes.length < limit; i++) {
-        const $ = cheerio.load(paneHtmls[i]);
-        allBookPanes.push($.root());
+      for (const html of uniquePanes) {
+        if (allBookPanes.length < limit) {
+          const $ = cheerio.load(html);
+          allBookPanes.push($.root());
+        }
       }
 
-      hasMorePages = paneHtmls.length >= 10;
-      pageNum++;
+      // Look for StoryGraph's real "Next" pagination link or button
+      const nextButton = await page.$("a[rel='next'], a:has-text('Next'), .pagination .next a");
 
-      if (pageNum > 10 || allBookPanes.length >= limit) {
-        hasMorePages = false;
+      if (nextButton && allBookPanes.length < limit) {
+        pageCount++;
+        console.log(`[SCRAPER] Clicking Next button for Page ${pageCount}...`);
+        
+        await Promise.all([
+          page.waitForResponse((resp) => resp.status() === 200, { timeout: 10000 }).catch(() => {}),
+          nextButton.click(),
+        ]);
+        
+        await page.waitForTimeout(2000); // Allow Turbo stream to attach new items to DOM
+      } else {
+        console.log(`[SCRAPER] No further 'Next' page button found. Finished scraping ${target}.`);
+        hasNextPage = false;
       }
     }
+  } catch (err) {
+    console.error(`[SCRAPER] Error while scraping ${url}:`, err.message);
   } finally {
     await browser.close();
   }
