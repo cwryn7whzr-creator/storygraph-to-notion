@@ -1,6 +1,6 @@
 import { Client } from "@notionhq/client";
 import * as scraper from "../functions/getList.js";
-import { enrichBooks } from "./storygraphExtras.js";
+import { enrichBooks, normTitle } from "./storygraphExtras.js";
 
 const notion = new Client({
   auth: process.env.NOTION_API_KEY,
@@ -10,19 +10,10 @@ const databaseId = process.env.NOTION_DATABASE_ID;
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-const validCover = (url) =>
-  typeof url === "string" &&
-  /^https?:\/\//i.test(url) &&
-  url.length < 2000
-    ? url
-    : null;
-
-const clean = (value) => String(value || "").replace(/\s+/g, " ").trim();
-
 const MAX_RETRIES = 6;
 
-// This is deliberately below Notion's average integration request capacity.
-const NOTION_MIN_INTERVAL_MS = 450;
+// Kept below Notion's practical per-integration request ceiling.
+const NOTION_MIN_INTERVAL_MS = 500;
 
 const stats = {
   created: 0,
@@ -32,6 +23,7 @@ const stats = {
   failed: [],
   noCover: [],
   noYear: [],
+  duplicateMatches: 0,
 };
 
 const optionalProps = {
@@ -42,6 +34,42 @@ const optionalProps = {
 };
 
 let lastNotionRequestAt = 0;
+
+const clean = (value) =>
+  String(value || "").replace(/\s+/g, " ").trim();
+
+const normAuthor = (value) =>
+  clean(value)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+
+const validExternalUrl = (url) =>
+  typeof url === "string" &&
+  /^https?:\/\//i.test(url) &&
+  url.length < 2000
+    ? url
+    : null;
+
+function guessImageContentType(url) {
+  if (/\.png(?:\?|$)/i.test(url)) return "image/png";
+  if (/\.webp(?:\?|$)/i.test(url)) return "image/webp";
+  if (/\.gif(?:\?|$)/i.test(url)) return "image/gif";
+  return "image/jpeg";
+}
+
+function safeCoverFilename(title, url) {
+  const extension =
+    url.match(/\.(jpe?g|png|webp|gif)(?:\?|$)/i)?.[1] || "jpg";
+
+  const base =
+    String(title || "book-cover")
+      .replace(/[^\w\- ]+/g, "")
+      .trim()
+      .slice(0, 70) || "book-cover";
+
+  return `${base}-cover.${extension}`;
+}
 
 async function notionRequest(fn, label, attempt = 1) {
   const waitMs = Math.max(
@@ -57,10 +85,10 @@ async function notionRequest(fn, label, attempt = 1) {
     lastNotionRequestAt = Date.now();
     return await fn();
   } catch (error) {
-    const isRateLimited =
+    const rateLimited =
       error?.status === 429 || error?.code === "rate_limited";
 
-    if (!isRateLimited || attempt >= MAX_RETRIES) {
+    if (!rateLimited || attempt >= MAX_RETRIES) {
       throw error;
     }
 
@@ -78,13 +106,14 @@ async function notionRequest(fn, label, attempt = 1) {
           );
 
     console.warn(
-      `[NOTION] Rate limited during ${label}. ` +
-        `Retry ${attempt}/${MAX_RETRIES - 1} in ${Math.ceil(
+      `[NOTION] Rate limited during ${label}. Retry ` +
+        `${attempt}/${MAX_RETRIES - 1} in ${Math.ceil(
           retryMs / 1000
         )}s...`
     );
 
     await delay(retryMs);
+
     return notionRequest(fn, label, attempt + 1);
   }
 }
@@ -109,13 +138,15 @@ function getNumber(property) {
   return property?.type === "number" ? property.number : null;
 }
 
-function getDateStart(property) {
-  return property?.type === "date" ? property.date?.start || null : null;
-}
-
 function getSelectName(property) {
   return property?.type === "select"
     ? property.select?.name || null
+    : null;
+}
+
+function getDateStart(property) {
+  return property?.type === "date"
+    ? property.date?.start || null
     : null;
 }
 
@@ -123,28 +154,6 @@ function getMultiSelectNames(property) {
   return property?.type === "multi_select"
     ? property.multi_select.map((item) => item.name).filter(Boolean)
     : [];
-}
-
-function getExternalFileUrl(property) {
-  if (property?.type !== "files") {
-    return null;
-  }
-
-  const file = property.files?.[0];
-
-  if (!file) {
-    return null;
-  }
-
-  if (file.type === "external") {
-    return file.external?.url || null;
-  }
-
-  if (file.type === "file") {
-    return file.file?.url || null;
-  }
-
-  return null;
 }
 
 function getPageCoverUrl(page) {
@@ -157,6 +166,10 @@ function getPageCoverUrl(page) {
   }
 
   return null;
+}
+
+function hasFilesProperty(property) {
+  return property?.type === "files" && property.files?.length > 0;
 }
 
 function titleProperty(value) {
@@ -183,17 +196,11 @@ function richTextProperty(value) {
   };
 }
 
-function filesProperty(url, title) {
+function multiSelectProperty(values) {
   return {
-    files: [
-      {
-        name: `${title || "Book"} Cover`.slice(0, 100),
-        type: "external",
-        external: {
-          url,
-        },
-      },
-    ],
+    multi_select: values.map((value) => ({
+      name: String(value).slice(0, 100),
+    })),
   };
 }
 
@@ -203,14 +210,6 @@ function coverPayload(url) {
     external: {
       url,
     },
-  };
-}
-
-function multiSelectProperty(values) {
-  return {
-    multi_select: values.map((value) => ({
-      name: String(value).slice(0, 100),
-    })),
   };
 }
 
@@ -232,12 +231,12 @@ function canUse(schema, propertyName, expectedType) {
 }
 
 async function checkDatabaseProperties() {
-  const database = await notionRequest(
+  const db = await notionRequest(
     () => notion.databases.retrieve({ database_id: databaseId }),
     "database schema retrieval"
   );
 
-  const schema = database.properties || {};
+  const schema = db.properties || {};
 
   optionalProps.yearsRead =
     schema["Years Read"]?.type === "multi_select";
@@ -256,34 +255,19 @@ async function checkDatabaseProperties() {
     Author: "rich_text",
     Status: "select",
     "Cover Image": "files",
-    "Date Read": "date",
     Rating: "number",
     Genres: "multi_select",
     Moods: "multi_select",
     "Page Count": "number",
   };
 
-  for (const [propertyName, expectedType] of Object.entries(
-    expectedProperties
-  )) {
-    if (schema[propertyName]?.type !== expectedType) {
+  for (const [name, type] of Object.entries(expectedProperties)) {
+    if (schema[name]?.type !== type) {
       console.warn(
-        `[NOTION] Property "${propertyName}" is missing or is not a ` +
-          `"${expectedType}" property. That field will be skipped.`
+        `[NOTION] Property "${name}" is missing or is not type "${type}". ` +
+          "That value will be skipped."
       );
     }
-  }
-
-  if (!optionalProps.yearsRead) {
-    console.warn(
-      '[NOTION] No Multi-select property named "Years Read"; it will be skipped.'
-    );
-  }
-
-  if (!optionalProps.timesRead) {
-    console.warn(
-      '[NOTION] No Number property named "Times Read"; it will be skipped.'
-    );
   }
 
   if (!optionalProps.storyGraphId) {
@@ -295,10 +279,46 @@ async function checkDatabaseProperties() {
   return schema;
 }
 
-// Fetch the database once, then match StoryGraph entries in memory by exact
-// title. This removes about one Notion query call per book.
+function pageCompleteness(page) {
+  const properties = page.properties || {};
+  let score = 0;
+
+  if (getPlainText(properties.Title)) score += 2;
+  if (getPlainText(properties.Author)) score += 2;
+  if (getSelectName(properties.Status)) score += 1;
+  if (getNumber(properties.Rating) !== null) score += 1;
+  if (getDateStart(properties["Date Read"])) score += 1;
+  if (getMultiSelectNames(properties.Genres).length) score += 2;
+  if (getMultiSelectNames(properties.Moods).length) score += 2;
+  if (getNumber(properties["Page Count"]) !== null) score += 1;
+  if (getNumber(properties["Year Read"]) !== null) score += 1;
+  if (getMultiSelectNames(properties["Years Read"]).length) score += 2;
+  if (getNumber(properties["Times Read"]) !== null) score += 1;
+  if (getPlainText(properties["StoryGraph ID"])) score += 3;
+  if (hasFilesProperty(properties["Cover Image"])) score += 2;
+  if (getPageCoverUrl(page)) score += 2;
+
+  return score;
+}
+
+function chooseCanonicalPage(candidates) {
+  return [...candidates].sort((left, right) => {
+    const scoreDifference =
+      pageCompleteness(right) - pageCompleteness(left);
+
+    if (scoreDifference !== 0) {
+      return scoreDifference;
+    }
+
+    return String(left.id).localeCompare(String(right.id));
+  })[0];
+}
+
 async function loadExistingPages() {
+  const pages = [];
   const byExactTitle = new Map();
+  const byStoryGraphId = new Map();
+
   let cursor = undefined;
 
   do {
@@ -313,35 +333,135 @@ async function loadExistingPages() {
     );
 
     for (const page of response.results) {
-      const title = getPlainText(page.properties?.Title);
+      pages.push(page);
 
-      if (!title) {
-        continue;
+      const properties = page.properties || {};
+      const title = getPlainText(properties.Title);
+      const storyGraphId = getPlainText(properties["StoryGraph ID"]);
+
+      if (title) {
+        const matches = byExactTitle.get(title) || [];
+        matches.push(page);
+        byExactTitle.set(title, matches);
       }
 
-      if (byExactTitle.has(title)) {
-        console.warn(
-          `[NOTION] Duplicate existing title "${title}". ` +
-            "The first page will be used; duplicate pages are not merged automatically."
-        );
-        continue;
+      if (storyGraphId) {
+        const matches = byStoryGraphId.get(storyGraphId) || [];
+        matches.push(page);
+        byStoryGraphId.set(storyGraphId, matches);
       }
-
-      byExactTitle.set(title, page);
     }
 
     cursor = response.has_more ? response.next_cursor : undefined;
   } while (cursor);
 
-  console.log(
-    `[NOTION] Loaded ${byExactTitle.size} existing pages for exact-title matching.`
-  );
+  console.log(`[NOTION] Loaded ${pages.length} existing pages.`);
 
-  return byExactTitle;
+  return {
+    pages,
+    byExactTitle,
+    byStoryGraphId,
+  };
 }
 
-// Keep your intentional rereads. The list contains one StoryGraph entry for
-// each completed read, while Notion has one page per exact displayed title.
+function sameAuthor(book, page) {
+  const existingAuthor = getPlainText(page.properties?.Author);
+
+  if (!book.author || !existingAuthor) {
+    return false;
+  }
+
+  return normAuthor(book.author) === normAuthor(existingAuthor);
+}
+
+// Exact title matches win. StoryGraph ID is used next. A normalized-title
+// fallback is accepted only when author names also match exactly after
+// normalization. This avoids merging different books with similar titles.
+function findExistingPage(book, indexes) {
+  const exactMatches = indexes.byExactTitle.get(book.title) || [];
+
+  if (exactMatches.length > 0) {
+    const canonical = chooseCanonicalPage(exactMatches);
+
+    if (exactMatches.length > 1) {
+      stats.duplicateMatches++;
+
+      console.warn(
+        `[DUPLICATE] Exact title "${book.title}" has ${exactMatches.length} ` +
+          `Notion pages. Keeping page ${canonical.id} as canonical ` +
+          `(data score ${pageCompleteness(canonical)}).`
+      );
+    }
+
+    return canonical;
+  }
+
+  if (book.id) {
+    const idMatches = indexes.byStoryGraphId.get(book.id) || [];
+
+    if (idMatches.length > 0) {
+      const canonical = chooseCanonicalPage(idMatches);
+
+      console.log(
+        `[MATCH] StoryGraph ID matched "${book.title}" to existing ` +
+          `"${getPlainText(canonical.properties?.Title)}".`
+      );
+
+      return canonical;
+    }
+  }
+
+  const normalizedBookTitle = normTitle(book.title);
+
+  const safeSimilarMatches = indexes.pages.filter((page) => {
+    const existingTitle = getPlainText(page.properties?.Title);
+
+    if (!existingTitle || normTitle(existingTitle) !== normalizedBookTitle) {
+      return false;
+    }
+
+    return sameAuthor(book, page);
+  });
+
+  if (safeSimilarMatches.length > 0) {
+    const canonical = chooseCanonicalPage(safeSimilarMatches);
+
+    stats.duplicateMatches++;
+
+    console.log(
+      `[MATCH] Normalized title + author matched "${book.title}" to ` +
+        `"${getPlainText(canonical.properties?.Title)}" ` +
+        `(data score ${pageCompleteness(canonical)}).`
+    );
+
+    return canonical;
+  }
+
+  return null;
+}
+
+function rememberPage(indexes, page) {
+  indexes.pages.push(page);
+
+  const properties = page.properties || {};
+  const title = getPlainText(properties.Title);
+  const storyGraphId = getPlainText(properties["StoryGraph ID"]);
+
+  if (title) {
+    const matches = indexes.byExactTitle.get(title) || [];
+    matches.push(page);
+    indexes.byExactTitle.set(title, matches);
+  }
+
+  if (storyGraphId) {
+    const matches = indexes.byStoryGraphId.get(storyGraphId) || [];
+    matches.push(page);
+    indexes.byStoryGraphId.set(storyGraphId, matches);
+  }
+}
+
+// Keeps intentional repeat reads. The book's displayed title is never
+// normalized or replaced; exact title remains the record key.
 function mergeRepeatBooks(books, listType) {
   if (listType !== "books-read") {
     return books;
@@ -376,26 +496,21 @@ function mergeRepeatBooks(books, listType) {
       first.yearsRead.push(book.yearRead);
     }
 
-    for (const key of [
+    for (const field of [
       "cover",
       "author",
       "pageCount",
       "dateRead",
       "rating",
       "id",
+      "bookUrl",
     ]) {
       if (
-        first[key] === undefined ||
-        first[key] === null ||
-        first[key] === ""
+        first[field] === undefined ||
+        first[field] === null ||
+        first[field] === ""
       ) {
-        if (
-          book[key] !== undefined &&
-          book[key] !== null &&
-          book[key] !== ""
-        ) {
-          first[key] = book[key];
-        }
+        first[field] = book[field];
       }
     }
 
@@ -409,7 +524,7 @@ function mergeRepeatBooks(books, listType) {
   }
 
   for (const book of byTitle.values()) {
-    book.yearsRead.sort((a, b) => a - b);
+    book.yearsRead.sort((left, right) => left - right);
 
     book.yearRead = book.yearsRead.length
       ? book.yearsRead[book.yearsRead.length - 1]
@@ -419,11 +534,45 @@ function mergeRepeatBooks(books, listType) {
   return merged;
 }
 
-// Used when creating a new Notion page. New pages get all available
-// StoryGraph information, including the same cover URL twice.
-function createBookProperties(book, listType, schema) {
-  const cover = validCover(book.cover);
+// Imports an external public image into Notion's file system. The returned
+// value is a file_upload object usable in a Files & media property.
+async function importCoverToNotion(imageUrl, title) {
+  const url = validExternalUrl(imageUrl);
 
+  if (!url) {
+    return null;
+  }
+
+  try {
+    const upload = await notionRequest(
+      () =>
+        notion.fileUploads.create({
+          mode: "external_url",
+          filename: safeCoverFilename(title, url),
+          content_type: guessImageContentType(url),
+          external_url: url,
+        }),
+      `import cover "${title}"`
+    );
+
+    console.log(`[COVER] Imported cover for "${title}".`);
+
+    return {
+      type: "file_upload",
+      file_upload: {
+        id: upload.id,
+      },
+    };
+  } catch (error) {
+    console.warn(
+      `[COVER] Could not import cover for "${title}": ${error.message}`
+    );
+
+    return null;
+  }
+}
+
+async function createBookProperties(book, listType, schema) {
   const properties = {
     Title: titleProperty(book.title),
   };
@@ -440,16 +589,22 @@ function createBookProperties(book, listType, schema) {
     };
   }
 
-  if (canUse(schema, "Cover Image", "files") && cover) {
-    properties["Cover Image"] = filesProperty(cover, book.title);
-  }
+  // New records get an actual Notion-imported image in the Files & media
+  // property, which can be selected as the Gallery card preview.
+  if (
+    canUse(schema, "Cover Image", "files") &&
+    validExternalUrl(book.cover)
+  ) {
+    const coverUpload = await importCoverToNotion(
+      book.cover,
+      book.title
+    );
 
-  if (canUse(schema, "Date Read", "date") && book.dateRead) {
-    properties["Date Read"] = {
-      date: {
-        start: book.dateRead,
-      },
-    };
+    if (coverUpload) {
+      properties["Cover Image"] = {
+        files: [coverUpload],
+      };
+    }
   }
 
   if (canUse(schema, "Rating", "number") && book.rating !== undefined) {
@@ -462,14 +617,14 @@ function createBookProperties(book, listType, schema) {
     canUse(schema, "Genres", "multi_select") &&
     book.genreTags?.length
   ) {
-    properties.Genres = multiSelectProperty(book.genreTags.slice(0, 10));
+    properties.Genres = multiSelectProperty(book.genreTags.slice(0, 20));
   }
 
   if (
     canUse(schema, "Moods", "multi_select") &&
     book.moodTags?.length
   ) {
-    properties.Moods = multiSelectProperty(book.moodTags.slice(0, 10));
+    properties.Moods = multiSelectProperty(book.moodTags.slice(0, 20));
   }
 
   if (canUse(schema, "Page Count", "number") && book.pageCount) {
@@ -502,47 +657,40 @@ function createBookProperties(book, listType, schema) {
 }
 
 // books-read:
-//   Fill blank fields only. Do not replace values already in Notion.
+//   Only fill Notion fields that are empty.
 //
 // to-read / currently-reading:
-//   Refresh values when StoryGraph provides a value. Do not clear a field when
-//   StoryGraph returns no value.
+//   Refresh fields when StoryGraph supplies a value. Do not erase a Notion
+//   value when StoryGraph supplies nothing.
 //
 // Covers:
-//   Always fill-only for all lists to protect your manual Notion cover work.
-function buildExistingPageUpdate(book, listType, existingPage, schema) {
-  const existing = existingPage.properties || {};
+//   Always fill-only. Existing page covers and existing Cover Image files are
+//   never overwritten.
+async function buildExistingPageUpdate(book, listType, page, schema) {
+  const existing = page.properties || {};
   const properties = {};
-
-  const sourceCover = validCover(book.cover);
-  const existingCoverProperty = getExternalFileUrl(
-    existing["Cover Image"]
-  );
-  const existingPageCover = getPageCoverUrl(existingPage);
 
   const isReadHistory = listType === "books-read";
   let cover;
 
-  // Cover Image property stays protected. Fill a blank property from an
-  // existing page cover first, otherwise use StoryGraph's source cover.
-  if (
-    canUse(schema, "Cover Image", "files") &&
-    !existingCoverProperty
-  ) {
-    const fillCover = sourceCover || existingPageCover;
-
-    if (fillCover) {
-      properties["Cover Image"] = filesProperty(fillCover, book.title);
-    }
+  if (!getPageCoverUrl(page) && validExternalUrl(book.cover)) {
+    cover = coverPayload(book.cover);
   }
 
-  // Page cover stays protected. Fill a blank page cover from the existing
-  // Files & media URL first, otherwise use StoryGraph's source cover.
-  if (!existingPageCover) {
-    const fillPageCover = sourceCover || existingCoverProperty;
+  if (
+    canUse(schema, "Cover Image", "files") &&
+    !hasFilesProperty(existing["Cover Image"]) &&
+    validExternalUrl(book.cover)
+  ) {
+    const coverUpload = await importCoverToNotion(
+      book.cover,
+      book.title
+    );
 
-    if (fillPageCover) {
-      cover = coverPayload(fillPageCover);
+    if (coverUpload) {
+      properties["Cover Image"] = {
+        files: [coverUpload],
+      };
     }
   }
 
@@ -566,18 +714,6 @@ function buildExistingPageUpdate(book, listType, existingPage, schema) {
   }
 
   if (
-    canUse(schema, "Date Read", "date") &&
-    book.dateRead &&
-    (!isReadHistory || !getDateStart(existing["Date Read"]))
-  ) {
-    properties["Date Read"] = {
-      date: {
-        start: book.dateRead,
-      },
-    };
-  }
-
-  if (
     canUse(schema, "Rating", "number") &&
     book.rating !== undefined &&
     (!isReadHistory || getNumber(existing.Rating) === null)
@@ -593,7 +729,7 @@ function buildExistingPageUpdate(book, listType, existingPage, schema) {
     (!isReadHistory ||
       getMultiSelectNames(existing.Genres).length === 0)
   ) {
-    properties.Genres = multiSelectProperty(book.genreTags.slice(0, 10));
+    properties.Genres = multiSelectProperty(book.genreTags.slice(0, 20));
   }
 
   if (
@@ -602,22 +738,20 @@ function buildExistingPageUpdate(book, listType, existingPage, schema) {
     (!isReadHistory ||
       getMultiSelectNames(existing.Moods).length === 0)
   ) {
-    properties.Moods = multiSelectProperty(book.moodTags.slice(0, 10));
+    properties.Moods = multiSelectProperty(book.moodTags.slice(0, 20));
   }
 
   if (
     canUse(schema, "Page Count", "number") &&
     book.pageCount &&
-    (!isReadHistory ||
-      getNumber(existing["Page Count"]) === null)
+    (!isReadHistory || getNumber(existing["Page Count"]) === null)
   ) {
     properties["Page Count"] = {
       number: Number(book.pageCount),
     };
   }
 
-  // Historic read-tracking fields remain fill-only, preserving any Notion
-  // adjustments you have made to years or count.
+  // These read-history values always remain fill-only.
   if (
     optionalProps.yearRead &&
     book.yearRead &&
@@ -646,8 +780,6 @@ function buildExistingPageUpdate(book, listType, existingPage, schema) {
     };
   }
 
-  // Useful as a non-destructive source identifier for diagnostics. It never
-  // changes a populated Notion ID.
   if (
     optionalProps.storyGraphId &&
     book.id &&
@@ -659,7 +791,7 @@ function buildExistingPageUpdate(book, listType, existingPage, schema) {
   return { properties, cover };
 }
 
-async function saveBook(book, listType, existingPages, schema) {
+async function saveBook(book, listType, indexes, schema) {
   if (!book?.title || book.title === "Untitled Book") {
     console.log(
       `Skipping entry with missing title (id: ${book?.id || "none"})...`
@@ -682,10 +814,14 @@ async function saveBook(book, listType, existingPages, schema) {
   }
 
   try {
-    const existingPage = existingPages.get(book.title);
+    const existingPage = findExistingPage(book, indexes);
 
     if (!existingPage) {
-      const cover = validCover(book.cover);
+      const properties = await createBookProperties(
+        book,
+        listType,
+        schema
+      );
 
       const page = await notionRequest(
         () =>
@@ -693,20 +829,22 @@ async function saveBook(book, listType, existingPages, schema) {
             parent: {
               database_id: databaseId,
             },
-            ...(cover ? { cover: coverPayload(cover) } : {}),
-            properties: createBookProperties(book, listType, schema),
+            ...(validExternalUrl(book.cover)
+              ? { cover: coverPayload(book.cover) }
+              : {}),
+            properties,
           }),
         `create "${book.title}"`
       );
 
-      existingPages.set(book.title, page);
-      stats.created++;
+      rememberPage(indexes, page);
 
+      stats.created++;
       console.log(`Added new book: ${book.title}`);
       return;
     }
 
-    const update = buildExistingPageUpdate(
+    const update = await buildExistingPageUpdate(
       book,
       listType,
       existingPage,
@@ -719,19 +857,16 @@ async function saveBook(book, listType, existingPages, schema) {
       return;
     }
 
-    const page = await notionRequest(
+    await notionRequest(
       () =>
         notion.pages.update({
           page_id: existingPage.id,
           ...(update.cover ? { cover: update.cover } : {}),
           properties: update.properties,
         }),
-      listType === "books-read"
-        ? `fill read-history blanks for "${book.title}"`
-        : `sync active-list fields for "${book.title}"`
+      `update "${book.title}"`
     );
 
-    existingPages.set(book.title, page);
     stats.updated++;
 
     console.log(
@@ -780,7 +915,6 @@ function logFieldCounts(listType, books) {
     `[FIELDS] ${listType}: ${books.length} books | ` +
       `cover ${count((book) => book.cover)} | ` +
       `rating ${count((book) => book.rating !== undefined)} | ` +
-      `dateRead ${count((book) => book.dateRead)} | ` +
       `genres ${count((book) => book.genreTags?.length)} | ` +
       `moods ${count((book) => book.moodTags?.length)} | ` +
       `pageCount ${count((book) => book.pageCount)} | ` +
@@ -816,10 +950,10 @@ async function syncAllToNotion() {
     }
 
     const schema = await checkDatabaseProperties();
-    const existingPages = await loadExistingPages();
+    const indexes = await loadExistingPages();
 
-    // Active lists update first. Read history is last but only fills blanks,
-    // so it cannot overwrite an existing active-list status.
+    // Active lists refresh first. books-read runs last but only fills blanks,
+    // so it cannot replace the active reading status of an existing book.
     const listTypes = [
       "to-read",
       "currently-reading",
@@ -867,7 +1001,7 @@ async function syncAllToNotion() {
       }
 
       for (const book of books) {
-        await saveBook(book, listType, existingPages, schema);
+        await saveBook(book, listType, indexes, schema);
       }
     }
 
@@ -876,7 +1010,8 @@ async function syncAllToNotion() {
     console.log(
       `Summary: ${stats.created} created, ${stats.updated} updated, ` +
         `${stats.unchanged} unchanged, ${stats.skipped} skipped, ` +
-        `${stats.failed.length} failed.`
+        `${stats.failed.length} failed, ${stats.duplicateMatches} ` +
+        "canonical duplicate matches."
     );
 
     if (stats.failed.length > 0) {
