@@ -40,14 +40,20 @@ export const normTitle = (title) =>
     .replace(/[^a-z0-9]+/g, " ")
     .trim();
 
-const bookIdFromHref = (href) =>
-  href?.match(/\/books\/([^/?#]+)/)?.[1] || null;
-
 // ---------------------------------------------------------------------------
 // 1. RATINGS
 // ---------------------------------------------------------------------------
 
+// Runs INSIDE the browser (page.evaluate). Anything it uses must be defined
+// inside it: functions from the rest of this file do not exist in the browser.
+// (The last run crashed with "bookIdFromHref is not defined" because of this.)
 export function extractReviewCardsInPage() {
+  const clean = (value) =>
+    String(value || "").replace(/\s+/g, " ").trim();
+
+  const bookIdFromHref = (href) =>
+    href?.match(/\/books\/([^/?#]+)/)?.[1] || null;
+
   const idsIn = (node) =>
     new Set(
       [...node.querySelectorAll("a[href*='/books/']")]
@@ -538,12 +544,15 @@ const CHART_CONFIG = {
     heading: "Moods",
     logName: "MOODS",
     maxLabels: MAX_MOOD_LABELS,
+    // Text of the "Contents" dropdown option that shows this chart.
+    selectPattern: /mood/i,
   },
   genres: {
     chartType: "Genres",
     heading: "Genres",
     logName: "GENRES",
     maxLabels: MAX_GENRE_LABELS,
+    selectPattern: /genre/i,
   },
 };
 
@@ -553,10 +562,12 @@ const normalizeChartLabel = (value) =>
     .replace(/\s+\d+$/, "")
     .slice(0, 100);
 
-const buildSegmentUrl = (chartType, label) => {
+// `userId` is whatever the site itself uses in its segment links (discovered
+// from the page). We only fall back to the username if none is found.
+const buildSegmentUrl = (chartType, label, userId) => {
   const url = new URL(`${BASE}/stats/segment/`);
 
-  url.searchParams.set("user_id", HARDCODED_USERNAME);
+  url.searchParams.set("user_id", userId);
   url.searchParams.set("chart_type", chartType);
   url.searchParams.set("label", label);
   url.searchParams.set("year", "0");
@@ -565,20 +576,31 @@ const buildSegmentUrl = (chartType, label) => {
   return url.toString();
 };
 
-// Runs inside the browser. It finds the section headed "Moods" or "Genres",
-// then collects short text fragments from the nearby chart area. This avoids
-// depending on chart bars being normal <a> links.
+// Runs INSIDE the browser. Finds the section headed "Moods" or "Genres", then
+// collects short text fragments from the nearby chart area. The heading can be
+// any kind of element (not only <h1>-<h6>), and the chart does not have to be
+// made of links.
 export function extractStatsChartLabels(headingText) {
   const cleanText = (value) =>
     String(value || "").replace(/\s+/g, " ").trim();
 
-  const heading = [
+  const wanted = String(headingText).toLowerCase();
+
+  const isHeading = (element) =>
+    cleanText(element.textContent).toLowerCase() === wanted;
+
+  let heading = [
     ...document.querySelectorAll("h1, h2, h3, h4, h5, h6"),
-  ].find(
-    (element) =>
-      cleanText(element.textContent).toLowerCase() ===
-      String(headingText).toLowerCase()
-  );
+  ].find(isHeading);
+
+  if (!heading) {
+    // Many pages use <div>/<span>/<p> for section titles.
+    heading = [
+      ...document.querySelectorAll(
+        "div, span, p, strong, b, label, legend, summary, button"
+      ),
+    ].find((element) => element.children.length === 0 && isHeading(element));
+  }
 
   if (!heading) {
     return {
@@ -658,9 +680,12 @@ export function extractStatsChartLabels(headingText) {
   };
 }
 
-// Runs inside the browser. It returns distinct StoryGraph book IDs found in a
-// stats segment result page.
+// Runs INSIDE the browser. Returns distinct StoryGraph book IDs found in a
+// stats segment result page. (Self-contained: see note on the ratings function.)
 export function extractSegmentBookIds() {
+  const bookIdFromHref = (href) =>
+    href?.match(/\/books\/([^/?#]+)/)?.[1] || null;
+
   return [
     ...new Set(
       [...document.querySelectorAll("a[href*='/books/']")]
@@ -668,6 +693,67 @@ export function extractSegmentBookIds() {
         .filter(Boolean)
     ),
   ];
+}
+
+// The Stats page has a "Contents" dropdown (default "Moods & Pace"). Other
+// charts, like Genres, may only be drawn after choosing them there. If it is a
+// normal <select>, switch it. Returns a short description, or null if there
+// was no matching <select> option.
+async function switchStatsSection(page, pattern) {
+  return page
+    .evaluate((patternSource) => {
+      const regex = new RegExp(patternSource, "i");
+
+      for (const select of document.querySelectorAll("select")) {
+        const option = [...select.options].find((item) =>
+          regex.test(item.textContent || "")
+        );
+
+        if (!option) {
+          continue;
+        }
+
+        if (select.value === option.value) {
+          return `"${option.textContent.trim()}" was already selected`;
+        }
+
+        select.value = option.value;
+        select.dispatchEvent(new Event("input", { bubbles: true }));
+        select.dispatchEvent(new Event("change", { bubbles: true }));
+
+        return `switched to "${option.textContent.trim()}"`;
+      }
+
+      return null;
+    }, pattern.source)
+    .catch(() => null);
+}
+
+// Looks in the page source for a real segment link so we can copy the
+// parameters StoryGraph itself uses (especially user_id).
+async function discoverSegmentUserId(page, logName) {
+  const html = await page.content().catch(() => "");
+
+  const match = html.match(/\/stats\/segment\/?\?[^"'\s<>\\]*/);
+
+  if (!match) {
+    console.log(
+      `[${logName}] No segment link found in the page source; ` +
+        `will try user_id="${HARDCODED_USERNAME}".`
+    );
+
+    return null;
+  }
+
+  const link = match[0].replace(/&amp;/g, "&");
+
+  console.log(`[${logName}] Segment link seen on the page: ${link.slice(0, 300)}`);
+
+  try {
+    return new URL(link, BASE).searchParams.get("user_id");
+  } catch {
+    return null;
+  }
 }
 
 async function scrapeChartLabels(kind) {
@@ -687,10 +773,22 @@ async function scrapeChartLabels(kind) {
         `[${config.logName}] Stats page could not be opened: ${status}.`
       );
 
-      return [];
+      return { labels: [], userId: null };
     }
 
+    await page.waitForSelector("svg, canvas", { timeout: 8000 }).catch(() => {});
     await page.waitForTimeout(2500);
+
+    const switched = await switchStatsSection(page, config.selectPattern);
+
+    if (switched) {
+      console.log(`[${config.logName}] "Contents" dropdown: ${switched}.`);
+
+      await page.waitForSelector("svg, canvas", { timeout: 8000 }).catch(() => {});
+      await page.waitForTimeout(2500);
+    }
+
+    const userId = await discoverSegmentUserId(page, config.logName);
 
     const result = await page.evaluate(
       extractStatsChartLabels,
@@ -708,6 +806,31 @@ async function scrapeChartLabels(kind) {
         `[${config.logName}] No chart labels found. ${result.debug}`
       );
 
+      // Put what the page really contains straight into the log, so nothing has to be downloaded.
+      const diagnostics = await page
+        .evaluate(() => ({
+          dropdowns: [...document.querySelectorAll("select")]
+            .map((select) =>
+              [...select.options]
+                .map((option) => option.textContent.trim())
+                .join(" / ")
+            )
+            .slice(0, 8),
+          text: (document.body.innerText || "")
+            .replace(/\s+/g, " ")
+            .slice(0, 1500),
+        }))
+        .catch(() => null);
+
+      if (diagnostics) {
+        console.warn(
+          `[${config.logName}] Page dropdowns: ${JSON.stringify(diagnostics.dropdowns)}`
+        );
+        console.warn(
+          `[${config.logName}] Page text: ${diagnostics.text}`
+        );
+      }
+
       await page
         .screenshot({
           path: `debug-${config.logName.toLowerCase()}-chart.png`,
@@ -720,7 +843,7 @@ async function scrapeChartLabels(kind) {
         await page.content()
       );
 
-      return [];
+      return { labels: [], userId };
     }
 
     console.log(
@@ -728,14 +851,14 @@ async function scrapeChartLabels(kind) {
         labels.join(" | ")
     );
 
-    return labels;
+    return { labels, userId };
   } finally {
     await page.close().catch(() => {});
   }
 }
 
-async function scrapeOneSegment(page, config, label) {
-  const url = buildSegmentUrl(config.chartType, label);
+async function scrapeOneSegment(page, config, label, userId) {
+  const url = buildSegmentUrl(config.chartType, label, userId);
 
   const status = await openPage(
     page,
@@ -765,10 +888,12 @@ async function scrapeOneSegment(page, config, label) {
     return [];
   }
 
+  // Only book IDs are needed here, so skip waiting for cover images.
   await loadEverythingOnPage(
     page,
     null,
-    `${config.logName.toLowerCase()} "${label}"`
+    `${config.logName.toLowerCase()} "${label}"`,
+    { waitForImages: false }
   );
 
   return page.evaluate(extractSegmentBookIds);
@@ -776,12 +901,19 @@ async function scrapeOneSegment(page, config, label) {
 
 async function scrapeChartAssignments(kind) {
   const config = CHART_CONFIG[kind];
-  const labels = await scrapeChartLabels(kind);
+  const { labels, userId: discoveredUserId } = await scrapeChartLabels(kind);
   const tagsByBookId = new Map();
 
   if (labels.length === 0) {
     return tagsByBookId;
   }
+
+  const userId = discoveredUserId || HARDCODED_USERNAME;
+
+  console.log(
+    `[${config.logName}] Using user_id="${userId}" ` +
+      `(${discoveredUserId ? "taken from the page" : "fallback: the username"}).`
+  );
 
   const context = await getContext();
   const page = await context.newPage();
@@ -795,7 +927,7 @@ async function scrapeChartAssignments(kind) {
           `fetching "${label}"...`
       );
 
-      const ids = await scrapeOneSegment(page, config, label);
+      const ids = await scrapeOneSegment(page, config, label, userId);
 
       for (const id of ids) {
         const tags = tagsByBookId.get(id) || [];
@@ -832,29 +964,34 @@ async function scrapeChartAssignments(kind) {
 
 let chartTagsPromise = null;
 
+// Moods first, then genres, one after the other: running both at once doubled
+// the request rate against a site that already challenges automated traffic.
 const getChartTags = () => {
-  chartTagsPromise ??= Promise.all([
-    scrapeChartAssignments("moods").catch((error) => {
-      console.error(
-        "[MOODS] Failed, continuing without moods:",
-        error.message
-      );
+  chartTagsPromise ??= (async () => {
+    const moodsByBookId = await scrapeChartAssignments("moods").catch(
+      (error) => {
+        console.error(
+          "[MOODS] Failed, continuing without moods:",
+          error.message
+        );
 
-      return new Map();
-    }),
+        return new Map();
+      }
+    );
 
-    scrapeChartAssignments("genres").catch((error) => {
-      console.error(
-        "[GENRES] Failed, continuing without genres:",
-        error.message
-      );
+    const genresByBookId = await scrapeChartAssignments("genres").catch(
+      (error) => {
+        console.error(
+          "[GENRES] Failed, continuing without genres:",
+          error.message
+        );
 
-      return new Map();
-    }),
-  ]).then(([moodsByBookId, genresByBookId]) => ({
-    moodsByBookId,
-    genresByBookId,
-  }));
+        return new Map();
+      }
+    );
+
+    return { moodsByBookId, genresByBookId };
+  })();
 
   return chartTagsPromise;
 };
