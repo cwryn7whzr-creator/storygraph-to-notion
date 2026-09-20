@@ -15,6 +15,42 @@ const MAX_RETRIES = 6;
 // Kept below Notion's practical per-integration request ceiling.
 const NOTION_MIN_INTERVAL_MS = 500;
 
+// ---------------------------------------------------------------------------
+// Run mode (set SYNC_MODE; the workflow passes it in)
+//
+//   active  (default)  to-read + currently-reading only. Fast: two StoryGraph pages.
+//   full               adds books-read, ratings and years read. Slow: run it by hand.
+//   cleanup            Notion only, no StoryGraph: merges and removes duplicate pages,
+//                      ties Times Read to the years found, repairs covers.
+//                      Preview only unless CLEANUP_APPLY=true.
+// ---------------------------------------------------------------------------
+
+const VALID_MODES = ["active", "full", "cleanup"];
+const MODE = String(process.env.SYNC_MODE || "active").trim().toLowerCase();
+const CLEANUP_APPLY =
+  String(process.env.CLEANUP_APPLY || "").trim().toLowerCase() === "true";
+
+const LISTS_BY_MODE = {
+  active: ["to-read", "currently-reading"],
+  full: ["to-read", "currently-reading", "books-read"],
+};
+
+// Importing a cover into Notion takes a few seconds each, so per run it is capped.
+// Whatever is left over is picked up on the next run.
+const COVER_REPAIR_LIMIT =
+  Number(process.env.COVER_REPAIR_LIMIT) > 0
+    ? Number(process.env.COVER_REPAIR_LIMIT)
+    : MODE === "cleanup"
+      ? 60
+      : 15;
+
+const coverBudget = { left: COVER_REPAIR_LIMIT };
+
+// Cleanup only: any year earlier than this is removed from Years Read. Use it to drop years
+// StoryGraph has no data for (an old bug labelled undated books "2017"). 0 = leave years alone.
+const MIN_YEAR_READ =
+  Number(process.env.MIN_YEAR_READ) > 0 ? Number(process.env.MIN_YEAR_READ) : 0;
+
 const stats = {
   created: 0,
   updated: 0,
@@ -60,7 +96,7 @@ const validExternalUrl = (url) =>
 
 function safeCoverFilename(title, url) {
   const extension =
-    url.match(/\.(jpe?g|png|webp|gif)(?:\?|$)/i)?.[1] || "jpg";
+    String(url || "").match(/\.(jpe?g|png|webp|gif)(?:\?|$)/i)?.[1] || "jpg";
 
   const base =
     String(title || "book-cover")
@@ -229,8 +265,9 @@ function listTypeToStatus(listType) {
 // ---------------------------------------------------------------------------
 // Notion property names.
 //
-// Property names are matched ignoring capitalization, spaces and punctuation,
-// so "Storygraph ID" is found even though this script says "StoryGraph ID".
+// Property names are matched ignoring capitalization, spaces, punctuation and a
+// trailing "s", so "Storygraph ID" is found even though this script says
+// "StoryGraph ID", and "Authors" is found for "Author".
 // P maps a plain key to the name your database actually uses. A key is left
 // out when the property is missing or has the wrong type, and that value is
 // then skipped instead of failing the sync.
@@ -254,7 +291,10 @@ const PROPERTY_SPECS = {
 const P = {};
 
 const normPropName = (name) =>
-  String(name).toLowerCase().replace(/[^a-z0-9]/g, "");
+  String(name)
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, "")
+    .replace(/s$/, "");
 
 // pv = "property value": a page's value for one of the keys above.
 const pv = (page, key) => (P[key] ? page?.properties?.[P[key]] : undefined);
@@ -319,7 +359,9 @@ async function checkDatabaseProperties() {
 }
 
 // ---------------------------------------------------------------------------
-// Existing pages: preload once, index, and pick a canonical page
+// Ranking pages: which of several pages for the same book is the one to keep.
+// Order of importance: has a rating, has a cover (either place), has a read
+// year, then how many other fields are filled in, then the older page.
 // ---------------------------------------------------------------------------
 
 function pageCompleteness(page) {
@@ -342,18 +384,62 @@ function pageCompleteness(page) {
   return score;
 }
 
-function chooseCanonicalPage(candidates) {
-  return [...candidates].sort((left, right) => {
-    const scoreDifference =
-      pageCompleteness(right) - pageCompleteness(left);
-
-    if (scoreDifference !== 0) {
-      return scoreDifference;
-    }
-
-    return String(left.id).localeCompare(String(right.id));
-  })[0];
+function pageSignals(page) {
+  return {
+    hasRating: getNumber(pv(page, "rating")) !== null,
+    hasCover:
+      hasFilesProperty(pv(page, "coverImage")) || Boolean(getPageCoverUrl(page)),
+    hasYears:
+      getMultiSelectNames(pv(page, "yearsRead")).length > 0 ||
+      getNumber(pv(page, "yearRead")) !== null,
+    score: pageCompleteness(page),
+  };
 }
+
+// Negative result = `left` is the better page to keep.
+function comparePages(left, right) {
+  const a = pageSignals(left);
+  const b = pageSignals(right);
+
+  for (const key of ["hasRating", "hasCover", "hasYears"]) {
+    if (a[key] !== b[key]) {
+      return a[key] ? -1 : 1;
+    }
+  }
+
+  if (a.score !== b.score) {
+    return b.score - a.score;
+  }
+
+  const created = String(left.created_time || "").localeCompare(
+    String(right.created_time || "")
+  );
+
+  if (created !== 0) {
+    return created;
+  }
+
+  return String(left.id).localeCompare(String(right.id));
+}
+
+function chooseCanonicalPage(candidates) {
+  return [...candidates].sort(comparePages)[0];
+}
+
+function describeForLog(page) {
+  const signals = pageSignals(page);
+  const years = getMultiSelectNames(pv(page, "yearsRead")).length;
+
+  return (
+    `${page.url || page.id} (rating ${signals.hasRating ? "yes" : "no"}, ` +
+    `cover ${signals.hasCover ? "yes" : "no"}, years ${years}, ` +
+    `data score ${signals.score})`
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Existing pages: preload once and index
+// ---------------------------------------------------------------------------
 
 const addToIndex = (map, key, page) => {
   const list = map.get(key) || [];
@@ -432,7 +518,7 @@ function idsAgree(book, page) {
 //   2. exact title (your existing behaviour; titles are never "cleaned up")
 //   3. normalized title + same author + agreeing IDs (punctuation/case variants)
 // Returns { page, duplicates } where duplicates are OTHER pages that matched
-// the same way. They are reported and merged into, never deleted.
+// the same way. They are merged into, and removed by the cleanup run.
 function findExistingPage(book, indexes) {
   const splitCanonical = (matches, via) => {
     const canonical = chooseCanonicalPage(matches);
@@ -514,23 +600,24 @@ function reportDuplicates(book, canonical, duplicates) {
 
   console.warn(
     `[DUPLICATE] "${book.title}" matches ${duplicates.length + 1} Notion ` +
-      `pages. Canonical (most complete, data score ` +
-      `${pageCompleteness(canonical)}): ${canonical.url}`
+      `pages. Kept: ${describeForLog(canonical)}`
   );
 
   for (const duplicate of duplicates) {
     console.warn(
-      `[DUPLICATE]   Left unchanged for manual review ` +
-        `(data score ${pageCompleteness(duplicate)}): ${duplicate.url}`
+      `[DUPLICATE]   Extra page, run the cleanup mode to merge and remove: ` +
+        describeForLog(duplicate)
     );
   }
 }
 
 // ---------------------------------------------------------------------------
-// Repeat reads (books-read only). One Notion page per book:
-//   Times Read = number of completed-read entries
+// Repeat reads (books-read only). One Notion page per book.
+//
 //   Years Read = every known year
-//   Year Read  = the most recent known year
+//   Times Read = how many years were found (at least 1). It is tied to the
+//                years on purpose: a book with 2 known years shows 2, however many
+//                entries StoryGraph has for it.
 //
 // Entries are combined when they share a StoryGraph ID (the same book read
 // again). Entries with DIFFERENT IDs are combined only when the title is
@@ -540,7 +627,7 @@ function reportDuplicates(book, canonical, duplicates) {
 
 function mergeRepeatBooks(books, listType) {
   if (listType !== "books-read") {
-    return { books, editionMerges: [] };
+    return { books, editionMerges: [], entryMismatches: [] };
   }
 
   const merged = [];
@@ -570,7 +657,7 @@ function mergeRepeatBooks(books, listType) {
     if (!target) {
       const copy = {
         ...book,
-        timesRead: 1,
+        listEntries: 1,
         yearsRead: book.yearRead ? [book.yearRead] : [],
       };
 
@@ -582,7 +669,7 @@ function mergeRepeatBooks(books, listType) {
       continue;
     }
 
-    target.timesRead++;
+    target.listEntries++;
 
     if (book.id && !byId.has(book.id)) {
       byId.set(book.id, target);
@@ -619,6 +706,8 @@ function mergeRepeatBooks(books, listType) {
     }
   }
 
+  const entryMismatches = [];
+
   for (const book of merged) {
     if (!book?.yearsRead) continue;
 
@@ -627,21 +716,104 @@ function mergeRepeatBooks(books, listType) {
     book.yearRead = book.yearsRead.length
       ? book.yearsRead[book.yearsRead.length - 1]
       : undefined;
+
+    book.timesRead = Math.max(1, book.yearsRead.length);
+
+    if (book.listEntries > book.timesRead) {
+      entryMismatches.push(
+        `${book.title.slice(0, 50)} (${book.listEntries} list entries, ` +
+          `${book.yearsRead.length} known years)`
+      );
+    }
   }
 
-  return { books: merged, editionMerges };
+  return { books: merged, editionMerges, entryMismatches };
 }
 
 // ---------------------------------------------------------------------------
 // Covers
 //
-// Cover Image is a Files & media property. For a Gallery card preview it needs
-// a real image. We ask Notion to import the picture from StoryGraph's URL,
-// wait for the import to finish, then attach it. If the import fails we fall
-// back to attaching the direct image link, so the property is not left empty.
-// Existing covers are never replaced.
+// A cover lives in two places: the Cover Image property (Files & media) and the
+// page's own cover. Rules:
+//
+//   * A link YOU added (Goodreads, Amazon, anything that is not StoryGraph) is
+//     never replaced. It is copied into whichever of the two places is empty or
+//     only holds a StoryGraph link.
+//   * Otherwise StoryGraph's cover is used in both places.
+//   * StoryGraph image links have no file extension, and Notion then shows a
+//     blank document icon instead of a thumbnail. Those are re-imported as real
+//     image files (a few per run, see COVER_REPAIR_LIMIT).
 // ---------------------------------------------------------------------------
 
+const IMAGE_EXT = /\.(jpe?g|png|webp|gif|avif)$/i;
+
+const urlHost = (url) => {
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return "";
+  }
+};
+
+const isStoryGraphUrl = (url) => /(^|\.)thestorygraph\.com$/i.test(urlHost(url));
+
+const urlHasImageExt = (url) => {
+  try {
+    return IMAGE_EXT.test(new URL(url).pathname);
+  } catch {
+    return false;
+  }
+};
+
+const nameHasImageExt = (name) => IMAGE_EXT.test(String(name || "").trim());
+
+const externalUrlOf = (file) =>
+  file?.type === "external" ? file.external?.url || null : null;
+
+// "Yours": any external link that is not StoryGraph's.
+const isYourCover = (url) => Boolean(url) && !isStoryGraphUrl(url);
+
+function bestYourCoverUrl(pages) {
+  for (const page of pages || []) {
+    const files = P.coverImage ? pv(page, "coverImage")?.files || [] : [];
+    const fromFile = files.map(externalUrlOf).filter(Boolean).find(isYourCover);
+
+    if (fromFile) {
+      return fromFile;
+    }
+
+    const fromCover = page?.cover?.type === "external" ? page.cover.external?.url : null;
+
+    if (isYourCover(fromCover)) {
+      return fromCover;
+    }
+  }
+
+  return null;
+}
+
+// Any external cover link at all (yours or StoryGraph's) found on these pages.
+function anyExternalCoverUrl(pages) {
+  for (const page of pages || []) {
+    const files = P.coverImage ? pv(page, "coverImage")?.files || [] : [];
+    const fromFile = files.map(externalUrlOf).filter(Boolean)[0];
+
+    if (fromFile) {
+      return fromFile;
+    }
+
+    const fromCover = page?.cover?.type === "external" ? page.cover.external?.url : null;
+
+    if (fromCover) {
+      return fromCover;
+    }
+  }
+
+  return null;
+}
+
+// Asks Notion to import the picture, waits for it to finish, and returns a
+// file_upload reference. Returns null if that fails.
 async function importCoverToNotion(url, title) {
   try {
     // content_type is left out on purpose: Notion works it out from the image.
@@ -695,28 +867,126 @@ async function importCoverToNotion(url, title) {
   }
 }
 
-async function buildCoverFile(book) {
-  const url = validExternalUrl(book.cover);
-
-  if (!url) {
-    return null;
-  }
-
-  const imported = await importCoverToNotion(url, book.title);
+// Import first; if that fails, attach the direct link with a proper image name.
+async function buildCoverFileFromUrl(url, title) {
+  const imported = await importCoverToNotion(url, title);
 
   if (imported) {
     return imported;
   }
 
   console.warn(
-    `[COVER] Attaching the direct image link for "${book.title}" instead of an imported file.`
+    `[COVER] Attaching the direct image link for "${title}" instead of an imported file.`
   );
 
   return {
     type: "external",
-    name: safeCoverFilename(book.title, url),
+    name: safeCoverFilename(title, url),
     external: { url },
   };
+}
+
+async function buildCoverFile(book) {
+  const url = validExternalUrl(book.cover);
+
+  return url ? buildCoverFileFromUrl(url, book.title) : null;
+}
+
+const externalFileEntry = (title, url) => ({
+  type: "external",
+  name: safeCoverFilename(title, url),
+  external: { url },
+});
+
+// Works out what, if anything, should change about a page's covers.
+//   sourceUrl       StoryGraph's cover URL for this book (null when there is none)
+//   manualCandidate a link of yours found on a duplicate page
+//   allowImport     false = look only, do not import (preview)
+// Returns { files, cover, kind, wouldImport }. `files` / `cover` are only set when
+// something should be written.
+async function planCovers(page, title, sourceUrl, options = {}) {
+  const { allowImport = true, manualCandidate = null } = options;
+  const result = { files: undefined, cover: undefined, kind: null, wouldImport: false };
+
+  const files = P.coverImage ? pv(page, "coverImage")?.files || [] : [];
+  const allExternal = files.every((file) => file.type === "external");
+  const fileUrls = files.map(externalUrlOf).filter(Boolean);
+
+  const pageCoverUrl = page?.cover?.type === "external" ? page.cover.external?.url || null : null;
+  const hasPageCover = Boolean(getPageCoverUrl(page));
+  const pageCoverIsStoryGraph = Boolean(pageCoverUrl) && isStoryGraphUrl(pageCoverUrl);
+
+  const ownFileUrl = fileUrls.find(isYourCover) || null;
+  const yourUrl =
+    ownFileUrl ||
+    (isYourCover(pageCoverUrl) ? pageCoverUrl : null) ||
+    (isYourCover(manualCandidate) ? manualCandidate : null);
+
+  // ---- A cover you added yourself exists: keep it, mirror it, never replace it ----
+  if (yourUrl) {
+    if (P.coverImage) {
+      if (ownFileUrl) {
+        const ownFile = files.find((file) => externalUrlOf(file) === ownFileUrl);
+
+        // Give a link with no extension anywhere a proper image name (avoids the blank icon).
+        if (allExternal && !urlHasImageExt(ownFileUrl) && !nameHasImageExt(ownFile.name)) {
+          result.files = files.map((file) => ({
+            type: "external",
+            name: file === ownFile ? safeCoverFilename(title, ownFileUrl) : file.name,
+            external: { url: externalUrlOf(file) },
+          }));
+          result.kind = "rename";
+        }
+      } else if (
+        files.length === 0 ||
+        (files.length > 0 && allExternal && fileUrls.every(isStoryGraphUrl))
+      ) {
+        result.files = [externalFileEntry(title, yourUrl)];
+        result.kind = "mirror";
+      }
+    }
+
+    if (!hasPageCover || pageCoverIsStoryGraph) {
+      result.cover = coverPayload(yourUrl);
+      result.kind = result.kind || "mirror";
+    }
+
+    return result;
+  }
+
+  // ---- No cover of yours: use StoryGraph's, in both places ----
+  const storyGraphUrl =
+    fileUrls.find(isStoryGraphUrl) ||
+    validExternalUrl(sourceUrl) ||
+    (pageCoverIsStoryGraph ? pageCoverUrl : null);
+
+  if (P.coverImage && storyGraphUrl) {
+    const needsImport = (file) =>
+      file.type === "external" && isStoryGraphUrl(file.external?.url) && !urlHasImageExt(file.external?.url);
+
+    const needsFile = files.length === 0;
+    const needsRepair = files.length === 1 && needsImport(files[0]);
+
+    if (needsFile || needsRepair) {
+      if (coverBudget.left <= 0) {
+        stats.coverDeferred = (stats.coverDeferred || 0) + 1;
+      } else if (!allowImport) {
+        result.wouldImport = true;
+        result.kind = needsFile ? "fill" : "repair";
+      } else {
+        coverBudget.left--;
+        result.files = [await buildCoverFileFromUrl(storyGraphUrl, title)];
+        result.kind = needsFile ? "fill" : "repair";
+      }
+    }
+  }
+
+  if (!hasPageCover && storyGraphUrl) {
+    result.cover = coverPayload(storyGraphUrl);
+    result.kind = result.kind || "fill";
+  }
+
+  return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -783,17 +1053,19 @@ async function createBookProperties(book, listType) {
 // Existing pages
 //
 // books-read:
-//   Only fill Notion fields that are empty.
+//   Only fill Notion fields that are empty. Status is the one exception: a book
+//   that has left your to-read / currently-reading lists and is now in books-read
+//   is switched to Read (full mode only, where all three lists are known).
 //
 // to-read / currently-reading:
 //   Refresh a field when StoryGraph supplies a usable value AND it differs from
 //   what Notion has. Never erase a value because StoryGraph supplied nothing.
 //
-// Read-history fields (Year Read, Years Read, Times Read, StoryGraph ID) and
-// covers are always fill-only. Nothing is written when nothing changed.
+// Read-history fields (Years Read, Times Read, StoryGraph ID) are always
+// fill-only. Covers follow the rules above. Nothing is written when nothing changed.
 // ---------------------------------------------------------------------------
 
-async function buildExistingPageUpdate(book, listType, page) {
+async function buildExistingPageUpdate(book, listType, page, duplicates = []) {
   const isReadHistory = listType === "books-read";
   const properties = {};
   let cover;
@@ -802,22 +1074,17 @@ async function buildExistingPageUpdate(book, listType, page) {
   const number = (key) => getNumber(pv(page, key));
   const names = (key) => getMultiSelectNames(pv(page, key));
 
-  // Page cover: fill only if the page has none.
-  if (!getPageCoverUrl(page) && validExternalUrl(book.cover)) {
-    cover = coverPayload(book.cover);
+  const coverPlan = await planCovers(page, book.title, validExternalUrl(book.cover), {
+    allowImport: true,
+    manualCandidate: bestYourCoverUrl(duplicates),
+  });
+
+  if (coverPlan.files && P.coverImage) {
+    properties[P.coverImage] = { files: coverPlan.files };
   }
 
-  // Cover Image property: fill only if empty.
-  if (
-    P.coverImage &&
-    !hasFilesProperty(pv(page, "coverImage")) &&
-    validExternalUrl(book.cover)
-  ) {
-    const coverFile = await buildCoverFile(book);
-
-    if (coverFile) {
-      properties[P.coverImage] = { files: [coverFile] };
-    }
+  if (coverPlan.cover) {
+    cover = coverPlan.cover;
   }
 
   if (P.author && hasKnownAuthor(book)) {
@@ -831,8 +1098,9 @@ async function buildExistingPageUpdate(book, listType, page) {
   if (P.status) {
     const current = getSelectName(pv(page, "status"));
     const wanted = listTypeToStatus(listType);
+    const fillOnly = isReadHistory && !book.overrideStatus;
 
-    if (isReadHistory ? !current : current !== wanted) {
+    if (fillOnly ? !current : current !== wanted) {
       properties[P.status] = { select: { name: wanted } };
     }
   }
@@ -889,10 +1157,8 @@ async function buildExistingPageUpdate(book, listType, page) {
   return { properties, cover };
 }
 
-// For confirmed duplicates, copy only non-destructive data into the canonical
-// page: union Years Read / Genres / Moods, keep the higher Times Read, fill
-// blanks. Nothing is removed from any page, and the duplicates stay untouched.
-// (Times Read is never added up: two duplicate pages may describe the same reads.)
+// Copies non-destructive data from duplicate pages into the page being kept:
+// union Years Read / Genres / Moods, and fill blanks. Nothing is removed from any page here.
 function applyDuplicateMerge(update, canonical, duplicates) {
   if (duplicates.length === 0) {
     return;
@@ -921,21 +1187,6 @@ function applyDuplicateMerge(update, canonical, duplicates) {
     }
   }
 
-  if (P.timesRead) {
-    const current = getNumber(pv(canonical, "timesRead"));
-    const pending = update.properties[P.timesRead]?.number;
-    const baseline = pending ?? current ?? 0;
-
-    const highest = Math.max(
-      0,
-      ...duplicates.map((duplicate) => getNumber(pv(duplicate, "timesRead")) ?? 0)
-    );
-
-    if (highest > baseline) {
-      update.properties[P.timesRead] = { number: highest };
-    }
-  }
-
   const fillBlank = (key, read, write) => {
     if (!P[key] || update.properties[P[key]]) return;
 
@@ -958,32 +1209,7 @@ function applyDuplicateMerge(update, canonical, duplicates) {
   fillBlank("rating", (page) => getNumber(pv(page, "rating")), (value) => ({ number: value }));
   fillBlank("pageCount", (page) => getNumber(pv(page, "pageCount")), (value) => ({ number: value }));
   fillBlank("yearRead", (page) => getNumber(pv(page, "yearRead")), (value) => ({ number: value }));
-
-  // Covers: only external links can be copied safely (Notion-hosted file links expire).
-  if (P.coverImage && !update.properties[P.coverImage] && !hasFilesProperty(pv(canonical, "coverImage"))) {
-    for (const duplicate of duplicates) {
-      const file = pv(duplicate, "coverImage")?.files?.find(
-        (item) => item.type === "external" && item.external?.url
-      );
-
-      if (file) {
-        update.properties[P.coverImage] = {
-          files: [{ type: "external", name: file.name, external: { url: file.external.url } }],
-        };
-        break;
-      }
-    }
-  }
-
-  if (!update.cover && !getPageCoverUrl(canonical)) {
-    const fromDuplicate = duplicates
-      .map((duplicate) => duplicate.cover)
-      .find((item) => item?.type === "external" && item.external?.url);
-
-    if (fromDuplicate) {
-      update.cover = coverPayload(fromDuplicate.external.url);
-    }
-  }
+  fillBlank("status", (page) => getSelectName(pv(page, "status")), (value) => ({ select: { name: value } }));
 }
 
 // ---------------------------------------------------------------------------
@@ -1042,7 +1268,7 @@ async function saveBook(book, listType, indexes) {
     reportDuplicates(book, existingPage, duplicates);
     warnIfAuthorDiffers(book, existingPage);
 
-    const update = await buildExistingPageUpdate(book, listType, existingPage);
+    const update = await buildExistingPageUpdate(book, listType, existingPage, duplicates);
 
     applyDuplicateMerge(update, existingPage, duplicates);
 
@@ -1067,10 +1293,15 @@ async function saveBook(book, listType, indexes) {
 
     stats.updated++;
 
+    const changed = [
+      ...Object.keys(update.properties),
+      ...(update.cover ? ["page cover"] : []),
+    ].join(", ");
+
     console.log(
       listType === "books-read"
-        ? `Filled missing read-history fields: ${book.title}`
-        : `Synced active-list fields: ${book.title}`
+        ? `Filled missing read-history fields (${changed}): ${book.title}`
+        : `Synced active-list fields (${changed}): ${book.title}`
     );
   } catch (error) {
     console.error(
@@ -1079,6 +1310,391 @@ async function saveBook(book, listType, indexes) {
     );
 
     stats.failed.push(book.title);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// CLEANUP MODE (Notion only, no StoryGraph)
+//
+// 1. Finds duplicate pages. Two pages are duplicates when they have the same
+//    StoryGraph ID. A page with no ID also counts as a duplicate of another page
+//    with the same title (ignoring case/punctuation) AND the same known author.
+//    Pages that carry two DIFFERENT StoryGraph IDs are never merged; they are
+//    listed for you to look at.
+// 2. Keeps the best page (rating, then cover, then read year, then most fields),
+//    copies anything useful from the others into it, and moves the others to
+//    Notion's trash (recoverable for 30 days).
+// 3. Ties Times Read to the number of years in Years Read.
+// 4. Repairs covers (see the cover rules above).
+//
+// Nothing is written unless CLEANUP_APPLY=true.
+// ---------------------------------------------------------------------------
+
+function findDuplicateGroups(pages) {
+  const parent = pages.map((_, index) => index);
+
+  const find = (index) => {
+    while (parent[index] !== index) {
+      parent[index] = parent[parent[index]];
+      index = parent[index];
+    }
+
+    return index;
+  };
+
+  const union = (a, b) => {
+    parent[find(a)] = find(b);
+  };
+
+  const ids = pages.map((page) => getPlainText(pv(page, "storyGraphId")));
+  const titles = pages.map((page) => normTitle(getPlainText(pv(page, "title"))));
+  const authors = pages.map((page) => authorKey(getPlainText(pv(page, "author"))));
+
+  // Same StoryGraph ID.
+  const firstWithId = new Map();
+
+  ids.forEach((id, index) => {
+    if (!id) return;
+
+    if (firstWithId.has(id)) {
+      union(index, firstWithId.get(id));
+    } else {
+      firstWithId.set(id, index);
+    }
+  });
+
+  // Same title and same known author, when at least one of the two has no ID.
+  const byTitle = new Map();
+
+  titles.forEach((title, index) => {
+    if (title) addToIndex(byTitle, title, index);
+  });
+
+  const editionPairs = [];
+
+  for (const list of byTitle.values()) {
+    for (let a = 0; a < list.length; a++) {
+      for (let b = a + 1; b < list.length; b++) {
+        const i = list[a];
+        const j = list[b];
+
+        if (!authors[i] || authors[i] !== authors[j]) continue;
+
+        if (ids[i] && ids[j]) {
+          if (ids[i] !== ids[j]) {
+            editionPairs.push(getPlainText(pv(pages[i], "title")));
+          }
+
+          continue;
+        }
+
+        union(i, j);
+      }
+    }
+  }
+
+  const components = new Map();
+
+  pages.forEach((page, index) => addToIndex(components, find(index), index));
+
+  const groups = [];
+  const review = [];
+
+  for (const members of components.values()) {
+    if (members.length < 2) continue;
+
+    const memberPages = members.map((index) => pages[index]);
+    const distinctIds = new Set(members.map((index) => ids[index]).filter(Boolean));
+
+    if (distinctIds.size > 1) {
+      review.push(memberPages);
+      continue;
+    }
+
+    const sorted = [...memberPages].sort(comparePages);
+
+    groups.push({ winner: sorted[0], losers: sorted.slice(1) });
+  }
+
+  return { groups, review, editionPairs: [...new Set(editionPairs)] };
+}
+
+// Moves a page to Notion's trash. Tries the older `archived` flag first and the newer
+// `in_trash` flag if the API rejects it.
+async function trashPage(page, title) {
+  try {
+    await notionRequest(
+      () => notion.pages.update({ page_id: page.id, archived: true }),
+      `trash "${title}"`
+    );
+  } catch (error) {
+    if (error?.status === 429) throw error;
+
+    await notionRequest(
+      () => notion.pages.update({ page_id: page.id, in_trash: true }),
+      `trash "${title}"`
+    );
+  }
+}
+
+// Removes years earlier than MIN_YEAR_READ from Years Read.
+function addOldYearStrip(update, page, title) {
+  if (!MIN_YEAR_READ || !P.yearsRead) return false;
+
+  const pending = update.properties[P.yearsRead]?.multi_select?.map((item) => item.name);
+  const years = pending ?? getMultiSelectNames(pv(page, "yearsRead"));
+  const kept = years.filter((year) => !(Number(year) > 0 && Number(year) < MIN_YEAR_READ));
+
+  if (kept.length === years.length) return false;
+
+  update.properties[P.yearsRead] = multiSelectProperty(sortYearNames(kept));
+
+  console.log(
+    `[YEARS] "${title}": removing ${years.filter((year) => !kept.includes(year)).join(", ")} ` +
+      `from Years Read (earlier than ${MIN_YEAR_READ}).`
+  );
+
+  return true;
+}
+
+// Times Read = number of years found.
+function addTimesReadFix(update, page, title) {
+  if (!P.timesRead || !P.yearsRead) return false;
+
+  const pendingYears = update.properties[P.yearsRead]?.multi_select?.map((item) => item.name);
+  const years = pendingYears ?? getMultiSelectNames(pv(page, "yearsRead"));
+
+  if (years.length === 0) return false;
+
+  const pendingTimes = update.properties[P.timesRead]?.number;
+  const current = pendingTimes ?? getNumber(pv(page, "timesRead"));
+
+  if (current === years.length) return false;
+
+  update.properties[P.timesRead] = { number: years.length };
+
+  console.log(
+    `[TIMES] "${title}": Times Read ${current ?? "empty"} -> ${years.length} ` +
+      `(years: ${sortYearNames(years).join(", ")})`
+  );
+
+  return true;
+}
+
+async function runCleanup(indexes) {
+  const apply = CLEANUP_APPLY;
+  const pages = indexes.pages;
+
+  const withId = pages.filter((page) => getPlainText(pv(page, "storyGraphId"))).length;
+
+  console.log(
+    `[CLEANUP] ${pages.length} pages loaded, ${withId} with a StoryGraph ID. ` +
+      (apply
+        ? "APPLY mode: changes will be written."
+        : "PREVIEW mode: nothing will be changed.")
+  );
+
+  if (!P.storyGraphId) {
+    console.warn(
+      '[CLEANUP] No "StoryGraph ID" property found, so duplicates can only be found by title + author.'
+    );
+  }
+
+  const summary = {
+    groups: 0,
+    trashed: 0,
+    years: 0,
+    times: 0,
+    covers: 0,
+    coverKinds: { mirror: 0, rename: 0, fill: 0, repair: 0 },
+    failed: 0,
+  };
+
+  const { groups, review, editionPairs } = findDuplicateGroups(pages);
+  const handled = new Set();
+  const trashedIds = new Set();
+
+  const finish = async (update, page, title, manualCandidate, sourceUrl = null) => {
+    addOldYearStrip(update, page, title) && summary.years++;
+    addTimesReadFix(update, page, title) && summary.times++;
+
+    const plan = await planCovers(page, title, sourceUrl, {
+      allowImport: apply,
+      manualCandidate,
+    });
+
+    if (plan.files && P.coverImage) {
+      update.properties[P.coverImage] = { files: plan.files };
+    }
+
+    if (plan.cover) {
+      update.cover = plan.cover;
+    }
+
+    if (plan.kind) {
+      summary.covers++;
+      summary.coverKinds[plan.kind]++;
+      console.log(
+        `[COVER] "${title}": ${plan.kind}` +
+          (plan.wouldImport ? " (would re-import as a real image file)" : "")
+      );
+    }
+
+    return update;
+  };
+
+  const write = async (update, page, title) => {
+    if (Object.keys(update.properties).length === 0 && !update.cover) {
+      return true;
+    }
+
+    if (!apply) {
+      return true;
+    }
+
+    try {
+      await notionRequest(
+        () =>
+          notion.pages.update({
+            page_id: page.id,
+            ...(update.cover ? { cover: update.cover } : {}),
+            properties: update.properties,
+          }),
+        `update "${title}"`
+      );
+
+      return true;
+    } catch (error) {
+      console.error(
+        `[CLEANUP] Could not update "${title}": [${error.code || error.status || "unknown"}] ${error.message}`
+      );
+
+      summary.failed++;
+      return false;
+    }
+  };
+
+  // ---- Duplicates ----
+  for (const group of groups) {
+    const { winner, losers } = group;
+    const title = getPlainText(pv(winner, "title")) || "(untitled)";
+
+    summary.groups++;
+
+    console.log(`[DEDUPE] "${title}": keep ${describeForLog(winner)}`);
+
+    for (const loser of losers) {
+      console.log(`[DEDUPE]   remove ${describeForLog(loser)}`);
+    }
+
+    const update = { properties: {}, cover: undefined };
+
+    applyDuplicateMerge(update, winner, losers);
+
+    await finish(
+      update,
+      winner,
+      title,
+      bestYourCoverUrl([winner, ...losers]),
+      anyExternalCoverUrl(losers)
+    );
+
+    handled.add(winner.id);
+
+    const saved = await write(update, winner, title);
+
+    if (!saved) {
+      console.warn(`[DEDUPE] "${title}": update failed, so the extra pages were left alone.`);
+      continue;
+    }
+
+    for (const loser of losers) {
+      summary.trashed++;
+      trashedIds.add(loser.id);
+
+      if (apply) {
+        try {
+          await trashPage(loser, title);
+        } catch (error) {
+          summary.trashed--;
+          summary.failed++;
+
+          console.error(
+            `[CLEANUP] Could not trash ${loser.url || loser.id}: ` +
+              `[${error.code || error.status || "unknown"}] ${error.message}`
+          );
+        }
+      }
+    }
+  }
+
+  // ---- Every other page: Times Read and covers ----
+  for (const page of pages) {
+    if (handled.has(page.id) || trashedIds.has(page.id)) continue;
+
+    const title = getPlainText(pv(page, "title")) || "(untitled)";
+    const update = { properties: {}, cover: undefined };
+
+    await finish(update, page, title, null);
+    await write(update, page, title);
+  }
+
+  // ---- Report ----
+  if (review.length > 0) {
+    console.warn(
+      `[CLEANUP] ${review.length} group(s) hold pages with DIFFERENT StoryGraph IDs and were left alone:`
+    );
+
+    for (const members of review) {
+      console.warn(
+        `[CLEANUP]   ${members.map((page) => page.url || page.id).join("  |  ")}`
+      );
+    }
+  }
+
+  if (editionPairs.length > 0) {
+    console.log(
+      `[CLEANUP] Same title and author but different StoryGraph IDs (probably different editions), ` +
+        `left alone: ${editionPairs.slice(0, 30).join(" | ")}`
+    );
+  }
+
+  const manyTimesNoYears = pages.filter(
+    (page) =>
+      !trashedIds.has(page.id) &&
+      getMultiSelectNames(pv(page, "yearsRead")).length === 0 &&
+      (getNumber(pv(page, "timesRead")) || 0) > 2
+  );
+
+  if (manyTimesNoYears.length > 0) {
+    console.log(
+      `[CLEANUP] Times Read is above 2 but no years are known for: ` +
+        manyTimesNoYears
+          .slice(0, 20)
+          .map((page) => getPlainText(pv(page, "title")).slice(0, 40))
+          .join(" | ")
+    );
+  }
+
+  console.log(
+    `[CLEANUP] ${apply ? "Done" : "Preview"}: ${summary.groups} duplicate group(s), ` +
+      `${summary.trashed} page(s) ${apply ? "moved to trash" : "would be moved to trash"}, ` +
+      (MIN_YEAR_READ ? `${summary.years} page(s) with years before ${MIN_YEAR_READ} removed, ` : "") +
+      `${summary.times} Times Read correction(s), ${summary.covers} cover fix(es) ` +
+      `(${Object.entries(summary.coverKinds)
+        .filter(([, count]) => count > 0)
+        .map(([kind, count]) => `${count} ${kind}`)
+        .join(", ") || "none"}), ${summary.failed} failed` +
+      (stats.coverDeferred
+        ? `, ${stats.coverDeferred} cover(s) left for the next run (limit ${COVER_REPAIR_LIMIT} per run)`
+        : "") +
+      "."
+  );
+
+  if (!apply) {
+    console.log(
+      "[CLEANUP] Nothing was changed. Run this again with apply turned on to make these changes."
+    );
   }
 }
 
@@ -1143,7 +1759,17 @@ function logNoYearBooks() {
 
 async function syncAllToNotion() {
   try {
-    console.log("Starting sync to Notion...");
+    if (!VALID_MODES.includes(MODE)) {
+      throw new Error(
+        `SYNC_MODE must be one of: ${VALID_MODES.join(", ")} (got "${MODE}").`
+      );
+    }
+
+    console.log(
+      `Starting sync to Notion (mode: ${MODE}` +
+        (MODE === "cleanup" ? (CLEANUP_APPLY ? ", APPLY" : ", preview only") : "") +
+        ")..."
+    );
 
     if (!process.env.NOTION_API_KEY || !databaseId) {
       throw new Error(
@@ -1154,15 +1780,16 @@ async function syncAllToNotion() {
     await checkDatabaseProperties();
     const indexes = await loadExistingPages();
 
-    // Active lists refresh first. books-read runs last but only fills blanks,
-    // so it cannot replace the active reading status of an existing book.
-    const listTypes = [
-      "to-read",
-      "currently-reading",
-      "books-read",
-    ];
+    if (MODE === "cleanup") {
+      await runCleanup(indexes);
+      return;
+    }
 
-    for (const listType of listTypes) {
+    // Books on your to-read / currently-reading lists keep that status even if they
+    // also appear in books-read.
+    const activeKeys = new Set();
+
+    for (const listType of LISTS_BY_MODE[MODE]) {
       console.log(`Fetching ${listType} list...`);
 
       const scraped = await scrapeStoryGraphList({
@@ -1171,34 +1798,64 @@ async function syncAllToNotion() {
 
       console.log(`Found ${scraped.length} books in ${listType}`);
 
-      await enrichBooks(scraped, listType);
+      // Cloudflare blocked StoryGraph. Nothing useful was fetched, so stop now instead of
+      // spending minutes on the remaining lists, and make the run show as failed.
+      if (scraper.wasBlocked?.()) {
+        console.error(
+          `StoryGraph's Cloudflare check blocked this run while fetching ${listType}. ` +
+            "Nothing was written for this list and the rest were skipped. Run it again later."
+        );
+
+        process.exitCode = 1;
+        break;
+      }
+
+      if (listType === "books-read") {
+        for (const book of scraped) {
+          book.overrideStatus = !(
+            (book.id && activeKeys.has(book.id)) || activeKeys.has(normTitle(book.title))
+          );
+        }
+
+        await enrichBooks(scraped, listType);
+      } else {
+        for (const book of scraped) {
+          if (book.id) activeKeys.add(book.id);
+          activeKeys.add(normTitle(book.title));
+        }
+      }
+
       logFieldCounts(listType, scraped);
 
-      const { books, editionMerges } = mergeRepeatBooks(scraped, listType);
+      const { books, editionMerges, entryMismatches } = mergeRepeatBooks(scraped, listType);
 
       if (books.length !== scraped.length) {
         const repeats = books.filter(
-          (book) => book.timesRead > 1
+          (book) => book.listEntries > 1
         );
 
         console.log(
           `Merged ${scraped.length} entries into ${books.length} titles ` +
-            "(repeat reads count toward Times Read)."
+            "(Times Read = number of years found)."
         );
 
         console.log(
-          `Read more than once (${repeats.length}): ` +
+          `Listed more than once (${repeats.length}): ` +
             repeats
               .slice(0, 40)
               .map(
                 (book) =>
-                  `${book.title.slice(0, 50)} (${book.timesRead}x${
-                    book.yearsRead.length
-                      ? `: ${book.yearsRead.join(", ")}`
-                      : ""
-                  })`
+                  `${book.title.slice(0, 50)} (${book.listEntries} entries` +
+                  `${book.yearsRead.length ? `; years ${book.yearsRead.join(", ")}` : ""})`
               )
               .join(" | ")
+        );
+      }
+
+      if (entryMismatches.length > 0) {
+        console.log(
+          `[TIMES] More list entries than known years, so Times Read follows the years: ` +
+            entryMismatches.slice(0, 20).join(" | ")
         );
       }
 
@@ -1221,7 +1878,7 @@ async function syncAllToNotion() {
       `Summary: ${stats.created} created, ${stats.updated} updated, ` +
         `${stats.unchanged} unchanged, ${stats.skipped} skipped, ` +
         `${stats.failed.length} failed, ${stats.duplicateMatches} ` +
-        "duplicate groups need manual review."
+        "duplicate groups (run cleanup mode to merge them)."
     );
 
     if (stats.failed.length > 0) {
@@ -1238,7 +1895,21 @@ async function syncAllToNotion() {
       );
     }
 
+    if (stats.coverDeferred) {
+      console.log(
+        `${stats.coverDeferred} cover(s) still need re-importing; they are picked up on the next run ` +
+          `(limit ${COVER_REPAIR_LIMIT} per run).`
+      );
+    }
+
     logNoYearBooks();
+
+    if (MODE === "active") {
+      console.log(
+        "Active mode checks only your to-read and currently-reading lists. A finished book " +
+          "switches to Read on the next full run."
+      );
+    }
   } catch (error) {
     console.error(`Error syncing to Notion: ${error.message}`);
     process.exitCode = 1;
