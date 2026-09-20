@@ -1,7 +1,18 @@
 export default function parseBookPane($pane) {
+  const BASE_URL = "https://app.thestorygraph.com";
+
+  // Helper to construct valid absolute URLs
+  const formatUrl = (rawUrl) => {
+    if (!rawUrl) return undefined;
+    if (rawUrl.startsWith("http://") || rawUrl.startsWith("https://")) {
+      return rawUrl;
+    }
+    return `${BASE_URL}${rawUrl.startsWith("/") ? "" : "/"}${rawUrl}`;
+  };
+
   // Extract book ID from href (e.g. /books/12345)
-  const bookLink = $pane.find("a[href*='/books/']").first().attr("href") || "";
-  const idMatch = bookLink.match(/\/books\/([a-zA-Z0-9-]+)/);
+  const rawBookLink = $pane.find("a[href*='/books/']").first().attr("href") || "";
+  const idMatch = rawBookLink.match(/\/books\/([a-zA-Z0-9-]+)/);
   const id = idMatch ? idMatch[1] : undefined;
 
   // Extract Title
@@ -17,11 +28,12 @@ export default function parseBookPane($pane) {
     $pane.find(".author").text().trim() ||
     "Unknown Author";
 
-  // Extract Cover Image URL
-  const cover =
+  // Extract Cover Image URL and force absolute URL formatting
+  const rawCover =
     $pane.find("img.book-cover").attr("src") ||
     $pane.find("img").attr("src") ||
     "";
+  const cover = formatUrl(rawCover);
 
   // Extract Read Date (e.g., "Read Dec 15, 2023" or "Finished Oct 2024")
   let dateRead = undefined;
