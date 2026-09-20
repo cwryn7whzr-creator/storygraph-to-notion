@@ -219,6 +219,8 @@ async function syncAllToNotion() {
     }
   } catch (error) {
     console.error("Error syncing to Notion:", error);
+  } finally {
+    await scraper.closeBrowser?.();
   }
 }
 
