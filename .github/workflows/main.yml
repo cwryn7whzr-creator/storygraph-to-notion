@@ -1,44 +1,59 @@
+name: StoryGraph to Notion Sync
+
 on:
   schedule:
-    # Fast run (to-read + currently-reading) three times a week: Monday, Wednesday, Friday.
-    # For every day instead, use "0 13 * * *". The hour is in UTC.
     - cron: "0 13 * * 1,3,5"
+
   workflow_dispatch:
     inputs:
       mode:
-        description: "active = to-read + currently-reading (fast) | full = also books-read, ratings, years (slow) | cleanup = merge/remove duplicates, fix Times Read and covers (Notion only)"
+        description: "active = to-read + currently-reading | full = also books-read | cleanup = Notion-only preview/cleanup"
         type: choice
         options:
           - active
           - full
           - cleanup
         default: active
+
       apply:
-        description: "cleanup only: tick to actually make the changes (unticked = preview only)"
+        description: "Cleanup only: check this to apply changes. Leave unchecked for preview."
         type: boolean
         default: false
+
       tags:
-        description: "full only: also import moods and genres (slow; they rarely change, so leave unticked most of the time)"
+        description: "Full only: import moods and genres."
         type: boolean
         default: false
+
       min_year:
-        description: "cleanup only: remove any Years Read value earlier than this year (StoryGraph has no data before 2018 for this account). Leave empty to keep all years."
+        description: "Cleanup only: report Years Read values before this year."
         type: string
         default: "2018"
 
 jobs:
   deploy:
-    # Cuts off a stuck run instead of letting it burn half an hour.
-        runs-on: ubuntu-latest
+    runs-on: ubuntu-latest
     timeout-minutes: 30
-    steps:
-      # ... your existing steps (checkout, setup node, install, etc.) stay unchanged ...
 
-      # Your existing "node utils/syncToNotion.js" step: keep whatever env it already has
-      # (NOTION_API_KEY, NOTION_DATABASE_ID, ...) and add these four lines under env:
-      - run: node utils/syncToNotion.js
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Sync StoryGraph to Notion
+        run: node utils/syncToNotion.js
         env:
-          SYNC_MODE: ${{ github.event.inputs.mode || 'active' }}
-          CLEANUP_APPLY: ${{ github.event.inputs.apply || 'false' }}
-          MIN_YEAR_READ: ${{ github.event.inputs.min_year || '' }}
-          ENRICH_TAGS: ${{ github.event.inputs.tags == 'true' && '1' || '' }}
+          NOTION_API_KEY: ${{ secrets.NOTION_API_KEY }}
+          NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
+          SYNC_MODE: ${{ inputs.mode || 'active' }}
+          CLEANUP_APPLY: ${{ inputs.apply && 'true' || 'false' }}
+          MIN_YEAR_READ: ${{ inputs.min_year || '2018' }}
+          ENRICH_TAGS: ${{ inputs.tags && '1' || '' }}
