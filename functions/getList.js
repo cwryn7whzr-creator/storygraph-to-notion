@@ -32,18 +32,28 @@ const fetchAllBookPanes = async (target, username, limit = Infinity) => {
     let pageCount = 1;
 
     while (hasNextPage && allBookPanes.length < limit) {
+      // Allow StoryGraph dynamic UI scripts to load
+      await page.waitForTimeout(2000);
+
+      // Scroll down to activate lazy-loaded elements
+      await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+      await page.waitForTimeout(1000);
+
+      // Wait for any standard book container or title element
       await page
-        .waitForSelector(".book-pane, .search-results-item, .book-title-author-and-series", {
-          timeout: 15000,
-        })
+        .waitForSelector(
+          ".book-pane, .search-results-item, .book-title-author-and-series, .book-pane-wrapper",
+          { timeout: 10000 }
+        )
         .catch(() => console.log(`[SCRAPER] Timeout waiting for cards on page ${pageCount}`));
 
-      await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-      await page.waitForTimeout(1500);
-
-      const paneHtmls = await page.$$eval(         ".book-pane, .search-results-item",         (elements) => elements.map((el) => el.outerHTML)       );        let finalPaneHtmls = paneHtmls;       if (finalPaneHtmls.length === 0) {         finalPaneHtmls = await page.$$eval(".book-title-author-and-series", (elements) =>
+      // Extract card HTMLs directly
+      const paneHtmls = await page.$$eval(         ".book-pane, .search-results-item, .book-pane-wrapper",         (elements) => elements.map((el) => el.outerHTML)       );        let finalPaneHtmls = paneHtmls;       if (finalPaneHtmls.length === 0) {         finalPaneHtmls = await page.$$eval(".book-title-author-and-series", (elements) =>
           elements.map((el) => {
-            const parent = el.closest(".book-pane") || el.closest(".search-results-item") || el.parentElement;
+            const parent =
+              el.closest(".book-pane") ||
+              el.closest(".search-results-item") ||
+              el.parentElement;
             return parent ? parent.outerHTML : el.outerHTML;
           })
         );
