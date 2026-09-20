@@ -5,7 +5,6 @@ const notion = new Client({
   auth: process.env.NOTION_API_KEY,
 });
 const databaseId = process.env.NOTION_DATABASE_ID;
-const username = process.env.USERNAME || "seaw457";
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -51,9 +50,9 @@ async function addBookToNotion(book, listType) {
         },
       },
       "Cover Image":
-        book.cover || book.bookCoverStoryGraphUrl
+        book.cover
           ? {
-              url: book.cover || book.bookCoverStoryGraphUrl,
+              url: book.cover,
             }
           : undefined,
       "Date Read": book.dateRead
@@ -92,7 +91,6 @@ async function addBookToNotion(book, listType) {
         : undefined,
     };
 
-    // Remove undefined fields before sending to Notion API
     Object.keys(bookProperties).forEach(
       (key) => bookProperties[key] === undefined && delete bookProperties[key]
     );
@@ -134,12 +132,11 @@ function listTypeToStatus(listType) {
   }
 }
 
-async function scrapeStoryGraphList({ target, username, limit }) {
+async function scrapeStoryGraphList({ target, limit }) {
   try {
     const result = await scraper.handler({
       queryStringParameters: {
         target,
-        username,
         limit,
       },
     });
@@ -159,7 +156,7 @@ async function syncAllToNotion() {
 
     for (const listType of listTypes) {
       console.log(`Fetching ${listType} list...`);
-      const books = await scrapeStoryGraphList({ target: listType, username });
+      const books = await scrapeStoryGraphList({ target: listType });
       console.log(`Found ${books.length} books in ${listType}`);
 
       for (const book of books) {
