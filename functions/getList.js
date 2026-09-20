@@ -9,9 +9,6 @@ const createStorygraphUrl = (target) => {
   if (target === "currently-reading") {
     return `https://app.thestorygraph.com/profile/${HARDCODED_USERNAME}`;
   }
-  if (target === "books-read") {
-    return `https://app.thestorygraph.com/books-read/${HARDCODED_USERNAME}`;
-  }
   return `https://app.thestorygraph.com/${target}/${HARDCODED_USERNAME}`;
 };
 
@@ -46,7 +43,7 @@ const fetchAllBookPanes = async (target, limit = Infinity) => {
     let pageCount = 1;
 
     while (hasNextPage && allBookPanes.length < limit) {
-      // Incremental smooth scroll to force lazy-loaded elements to hydrate
+      // Incremental smooth scroll to force lazy-loaded images (data-src) to hydrate
       await page.evaluate(async () => {
         for (let i = 0; i < document.body.scrollHeight; i += 300) {
           window.scrollTo(0, i);
@@ -55,10 +52,8 @@ const fetchAllBookPanes = async (target, limit = Infinity) => {
       });
       await page.waitForTimeout(1000);
 
-      // Enhanced selector matching both list pages and profile widgets
-      const cardSelector = target === "currently-reading"
-        ? ".currently-reading-cover-wrapper, .book-pane, .book-pane-wrapper, div:has(> a[href*='/books/'])"
-        : ".book-pane, .search-results-item, .book-pane-wrapper";
+      const cardSelector =
+        ".book-pane, .search-results-item, .book-pane-wrapper, .currently-reading-cover-wrapper, .book-title-author-and-series";
 
       await page.waitForSelector(cardSelector, { timeout: 10000 }).catch(() => {});
 
@@ -69,7 +64,6 @@ const fetchAllBookPanes = async (target, limit = Infinity) => {
               el.closest(".book-pane") ||
               el.closest(".search-results-item") ||
               el.closest(".book-pane-wrapper") ||
-              el.closest(".currently-reading-cover-wrapper") ||
               el;
             return card ? card.outerHTML : "";
           })
@@ -91,7 +85,6 @@ const fetchAllBookPanes = async (target, limit = Infinity) => {
         }
       }
 
-      // Profile page doesn't have list pagination
       if (target === "currently-reading") {
         hasNextPage = false;
         break;
