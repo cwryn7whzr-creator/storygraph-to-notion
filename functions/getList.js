@@ -3,10 +3,12 @@ import { chromium } from "playwright";
 import * as cheerio from "cheerio";
 import parseBookPane from "../utils/parseBookPane.js";
 
-// Directly hardcode your StoryGraph handle here
-const HARDCODED_USERNAME = "seaw457"; 
+const HARDCODED_USERNAME = "seaw457";
 
 const createStorygraphUrl = (target) => {
+  if (target === "currently-reading") {
+    return `https://app.thestorygraph.com/profile/${HARDCODED_USERNAME}`;
+  }
   return `https://app.thestorygraph.com/${target}/${HARDCODED_USERNAME}`;
 };
 
@@ -24,50 +26,49 @@ const fetchAllBookPanes = async (target, username, limit = Infinity) => {
   });
 
   const page = await context.newPage();
-  const url = createStorygraphUrl(target); // Uses the hardcoded URL directly
+  const url = createStorygraphUrl(target);
 
   try {
     console.log(`[SCRAPER] Navigating to ${url}...`);
-    const response = await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+    const response = await page.goto(url, { waitUntil: "domcontentloaded", timeout: 35000 });
 
     if (response && response.status() === 404) {
-      console.error(`[SCRAPER] Page returned 404 at ${url}. Check handle.`);
+      console.error(`[SCRAPER] Page returned 404 at ${url}.`);
       return [];
     }
 
-    // Give dynamic client-side scripts time to populate DOM
     await page.waitForTimeout(3000);
-
-    // Scroll down to trigger lazy loading for card covers and pagination
-    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-    await page.waitForTimeout(1000);
 
     let hasNextPage = true;
     let pageCount = 1;
 
     while (hasNextPage && allBookPanes.length < limit) {
-      // Primary card selectors
-      await page
-        .waitForSelector(
-          ".book-pane, .search-results-item, .book-title-author-and-series, .book-pane-wrapper",
-          { timeout: 10000 }
-        )
-        .catch(() => {});
+      await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight / 2));
+      await page.waitForTimeout(500);
+      await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+      await page.waitForTimeout(1000);
 
-      // Extract raw card HTML elements
-      const paneHtmls = await page.$$eval(         ".book-pane, .search-results-item, .book-pane-wrapper",         (elements) => elements.map((el) => el.outerHTML)       );        let finalPaneHtmls = paneHtmls;       if (finalPaneHtmls.length === 0) {         finalPaneHtmls = await page.$$eval(".book-title-author-and-series", (elements) =>
-          elements.map((el) => {
-            const parent =
+      const cardSelector =
+        target === "currently-reading"
+          ? ".currently-reading-cover-wrapper, .book-pane, .search-results-item"
+          : ".book-pane, .search-results-item, .book-pane-wrapper";
+
+      await page.waitForSelector(cardSelector, { timeout: 10000 }).catch(() => {});
+
+      const paneHtmls = await page.$$eval(cardSelector, (elements) =>
+        elements
+          .map((el) => {
+            const card =
               el.closest(".book-pane") ||
               el.closest(".search-results-item") ||
               el.closest(".book-pane-wrapper") ||
-              el.parentElement;
-            return parent ? parent.outerHTML : el.outerHTML;
+              el;
+            return card ? card.outerHTML : "";
           })
-        );
-      }
+          .filter(Boolean)
+      );
 
-      const uniquePanes = [...new Set(finalPaneHtmls)].filter(Boolean);
+      const uniquePanes = [...new Set(paneHtmls)].filter(Boolean);
       console.log(`[SCRAPER] Page ${pageCount}: Found ${uniquePanes.length} books in ${target}.`);
 
       if (uniquePanes.length === 0) {
@@ -82,17 +83,25 @@ const fetchAllBookPanes = async (target, username, limit = Infinity) => {
         }
       }
 
-      // Pagination selector matching active "Next" buttons
+      if (target === "currently-reading") {
+        hasNextPage = false;
+        break;
+      }
+
       const paginationSelector =
-        ".pagination .next a:not(.disabled), .pagination a[rel='next']:not(.disabled), a.next_page:not(.disabled)";
+        ".pagination .next a, .pagination a[rel='next'], a.next_page, .pagination a:has-text('›'), .pagination a:has-text('Next'), a[href*='page=']";
 
       const nextButton = await page.$(paginationSelector);
 
       if (nextButton && allBookPanes.length < limit) {
         const isVisible = await nextButton.isVisible().catch(() => false);
+        const isDisabled = await page.evaluate(
+          (el) => el.classList.contains("disabled") || el.getAttribute("aria-disabled") === "true",
+          nextButton
+        );
 
-        if (!isVisible) {
-          console.log(`[SCRAPER] Next page link is hidden. Reached last page for ${target}.`);
+        if (!isVisible || isDisabled) {
+          console.log(`[SCRAPER] Reached last page for ${target}.`);
           hasNextPage = false;
           break;
         }
