@@ -6,7 +6,7 @@ import parseBookPane from "../utils/parseBookPane.js";
 
 const HARDCODED_USERNAME = "seaw457";
 const MAX_PAGES = 200; // safety cap so a bad selector can never loop forever
-const PAGE_DELAY_MS = 1500; // be polite to avoid throttling
+const CHALLENGE_TITLE = /just a moment|attention required|checking your browser/i;
 
 const createStorygraphUrl = (target) => {
   if (target === "currently-reading") {
@@ -15,24 +15,99 @@ const createStorygraphUrl = (target) => {
   return `https://app.thestorygraph.com/${target}/${HARDCODED_USERNAME}`;
 };
 
+const pause = (baseMs) => new Promise((r) => setTimeout(r, baseMs + Math.random() * 1200));
+
+// ---------------------------------------------------------------------------
+// One shared browser for the whole run. Cloudflare hands out a "you passed"
+// cookie once a check succeeds; reusing the same browser keeps that cookie
+// for every later page and list instead of being challenged again each time.
+// ---------------------------------------------------------------------------
+let sharedBrowser = null;
+let sharedContext = null;
+
+const getContext = async () => {
+  if (sharedContext) return sharedContext;
+
+  const launchOptions = {
+    headless: process.env.HEADED !== "1", // HEADED=1 + xvfb-run is the stealthier option
+    args: [
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-blink-features=AutomationControlled",
+    ],
+  };
+
+  try {
+    // GitHub's Ubuntu runners include real Google Chrome, which looks far
+    // more like a normal visitor than the stripped-down bundled Chromium.
+    sharedBrowser = await chromium.launch({ ...launchOptions, channel: "chrome" });
+    console.log("[SCRAPER] Using installed Google Chrome.");
+  } catch (err) {
+    console.warn(
+      `[SCRAPER] Google Chrome not available (${err.message.split("\n")[0]}). Using bundled Chromium.`
+    );
+    sharedBrowser = await chromium.launch(launchOptions);
+  }
+
+  // Build a user agent that matches the real browser version and OS.
+  const major = sharedBrowser.version().split(".")[0];
+  sharedContext = await sharedBrowser.newContext({
+    viewport: { width: 1280, height: 1000 },
+    locale: "en-US",
+    timezoneId: "America/New_York",
+    userAgent: `Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${major}.0.0.0 Safari/537.36`,
+  });
+
+  await sharedContext.addInitScript(() => {
+    Object.defineProperty(navigator, "webdriver", { get: () => undefined });
+  });
+
+  return sharedContext;
+};
+
+// Call this once at the very end of the run (syncToNotion.js does this).
+export const closeBrowser = async () => {
+  if (sharedBrowser) await sharedBrowser.close().catch(() => {});
+  sharedBrowser = null;
+  sharedContext = null;
+};
+
+// ---------------------------------------------------------------------------
+// Opens a URL and, if Cloudflare shows its "Just a moment..." check, waits for
+// it to clear (it often clears by itself in a few seconds). Retries up to 3x.
+// Returns "ok", "404" or "blocked".
+// ---------------------------------------------------------------------------
+const openPage = async (page, url, label) => {
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const response = await page.goto(url, { waitUntil: "domcontentloaded", timeout: 35000 });
+    if (response && response.status() === 404) return "404";
+
+    let title = await page.title().catch(() => "Just a moment...");
+
+    if (CHALLENGE_TITLE.test(title)) {
+      console.log(`[SCRAPER] ${label}: Cloudflare check (attempt ${attempt}). Waiting for it to clear...`);
+      for (let i = 0; i < 45 && CHALLENGE_TITLE.test(title); i++) {
+        await page.waitForTimeout(1000);
+        // title() can throw while the page is redirecting after the check
+        title = await page.title().catch(() => "Just a moment...");
+      }
+    }
+
+    if (!CHALLENGE_TITLE.test(title)) return "ok";
+
+    console.warn(`[SCRAPER] ${label}: still blocked after attempt ${attempt}.`);
+    await page.waitForTimeout(5000 * attempt);
+  }
+  return "blocked";
+};
+
 const fetchAllBookPanes = async (target, limit = Infinity) => {
   // Map of bookId -> card HTML. De-dupes by book, and lets us keep the most
   // complete HTML if the same book is matched by more than one element.
   const books = new Map();
-
-  const browser = await chromium.launch({
-    headless: true,
-    args: ["--no-sandbox", "--disable-setuid-sandbox"],
-  });
-
-  const context = await browser.newContext({
-    viewport: { width: 1280, height: 1000 },
-    userAgent:
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-  });
-
-  const page = await context.newPage();
   const baseUrl = createStorygraphUrl(target);
+  const context = await getContext();
+  const page = await context.newPage();
 
   const cardSelector =
     target === "currently-reading"
@@ -49,13 +124,21 @@ const fetchAllBookPanes = async (target, limit = Infinity) => {
       if (pageCount > 1) u.searchParams.set("page", String(pageCount));
       console.log(`[SCRAPER] ${target}: navigating to page ${pageCount}: ${u}`);
 
-      const response = await page.goto(u.toString(), {
-        waitUntil: "domcontentloaded",
-        timeout: 35000,
-      });
+      const status = await openPage(page, u.toString(), `${target} p${pageCount}`);
 
-      if (response && response.status() === 404) {
+      if (status === "404") {
         console.error(`[SCRAPER] ${target}: 404 at ${u}.`);
+        break;
+      }
+
+      if (status === "blocked") {
+        console.warn(
+          `[SCRAPER] ${target}: BLOCKED by Cloudflare on page ${pageCount}. ` +
+            (pageCount > 1
+              ? `Results are PARTIAL (${books.size} books so far); the list was NOT fully scraped.`
+              : "No books collected.")
+        );
+        await page.screenshot({ path: `debug-${target}-blocked.png`, fullPage: true }).catch(() => {});
         break;
       }
 
@@ -68,7 +151,6 @@ const fetchAllBookPanes = async (target, limit = Infinity) => {
             `URL: ${page.url()} | Title: ${await page.title()}`
         );
         if (pageCount === 1) {
-          // Empty first page = selector, privacy, or bot-block problem. Save evidence.
           await page.screenshot({ path: `debug-${target}.png`, fullPage: true });
           fs.writeFileSync(`debug-${target}.html`, await page.content());
           console.warn(`[SCRAPER] ${target}: saved debug-${target}.png and debug-${target}.html`);
@@ -165,13 +247,13 @@ const fetchAllBookPanes = async (target, limit = Infinity) => {
         hasNextPage = false;
       } else {
         pageCount++;
-        await page.waitForTimeout(PAGE_DELAY_MS);
+        await pause(2500); // slower, slightly random pacing looks less like a bot
       }
     }
   } catch (err) {
     console.error(`[SCRAPER] Error while scraping ${baseUrl}:`, err.message);
   } finally {
-    await browser.close();
+    await page.close().catch(() => {});
   }
 
   console.log(`[SCRAPER] ${target}: finished with ${books.size} books.`);
