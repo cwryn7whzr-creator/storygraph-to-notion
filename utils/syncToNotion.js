@@ -13,9 +13,10 @@ const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const validCover = (url) =>
   typeof url === "string" && /^https?:\/\//i.test(url) && url.length < 2000 ? url : null;
 
-const stats = { saved: 0, skipped: 0, failed: [] };
+const MAX_RETRIES = 6;
+const stats = { saved: 0, skipped: 0, failed: [], noCover: [] };
 
-async function addBookToNotion(book, listType) {
+async function addBookToNotion(book, listType, attempt = 1) {
   if (!book || !book.title || book.title === "Untitled Book") {
     console.log(`Skipping entry with missing title (id: ${book?.id ?? "none"})...`);
     stats.skipped++;
@@ -27,6 +28,7 @@ async function addBookToNotion(book, listType) {
     if (book.cover && !cover) {
       console.warn(`Bad cover URL for "${book.title}": ${String(book.cover).slice(0, 100)}`);
     }
+    if (!book.cover && attempt === 1) stats.noCover.push(book.title);
 
     const response = await notion.databases.query({
       database_id: databaseId,
@@ -145,10 +147,13 @@ async function addBookToNotion(book, listType) {
     }
     stats.saved++;
   } catch (error) {
-    if (error.status === 429) {
-      console.warn(`Rate limited on "${book.title}". Retrying in 3 seconds...`);
-      await delay(3000);
-      return addBookToNotion(book, listType);
+    if ((error.status === 429 || error.code === "rate_limited") && attempt < MAX_RETRIES) {
+      // Use Notion's own "retry after" hint when it gives one, otherwise back off.
+      const hint = Number(error.headers?.get?.("retry-after") ?? error.headers?.["retry-after"]);
+      const waitMs = Number.isFinite(hint) && hint > 0 ? hint * 1000 : 3000 * attempt;
+      console.warn(`Rate limited on "${book.title}". Retry ${attempt}/${MAX_RETRIES - 1} in ${waitMs / 1000}s...`);
+      await delay(waitMs);
+      return addBookToNotion(book, listType, attempt + 1);
     }
     // Notion's message says exactly which property or value it rejected.
     console.error(
@@ -193,20 +198,36 @@ async function scrapeStoryGraphList({ target, limit }) {
   }
 }
 
+// Prints how many books actually had each field, so we can see at a glance
+// which parts of the parser are finding data.
+function logFieldCounts(listType, books) {
+  const n = (test) => books.filter(test).length;
+  console.log(
+    `[FIELDS] ${listType}: ${books.length} books | cover ${n((b) => b.cover)} | ` +
+      `rating ${n((b) => b.rating !== undefined)} | dateRead ${n((b) => b.dateRead)} | ` +
+      `genres ${n((b) => b.genreTags?.length)} | moods ${n((b) => b.moodTags?.length)} | ` +
+      `pageCount ${n((b) => b.pageCount)}`
+  );
+}
+
 async function syncAllToNotion() {
   try {
     console.log("Starting sync to Notion...");
 
-    const listTypes = ["books-read", "currently-reading", "to-read"];
+    // Order matters: a book on more than one list keeps the status from the
+    // LAST list processed. "Read" goes last so it isn't overwritten by
+    // "Want to Read" or "Reading".
+    const listTypes = ["to-read", "currently-reading", "books-read"];
 
     for (const listType of listTypes) {
       console.log(`Fetching ${listType} list...`);
       const books = await scrapeStoryGraphList({ target: listType });
       console.log(`Found ${books.length} books in ${listType}`);
+      logFieldCounts(listType, books);
 
       for (const book of books) {
         await addBookToNotion(book, listType);
-        await delay(350);
+        await delay(600); // 2 Notion requests per book; this keeps us under the rate limit
       }
     }
 
@@ -216,6 +237,12 @@ async function syncAllToNotion() {
     );
     if (stats.failed.length > 0) {
       console.log(`Failed books: ${stats.failed.join(" | ")}`);
+    }
+    if (stats.noCover.length > 0) {
+      console.log(
+        `No cover found for ${stats.noCover.length} books: ${stats.noCover.slice(0, 30).join(" | ")}` +
+          (stats.noCover.length > 30 ? " | ..." : "")
+      );
     }
   } catch (error) {
     console.error("Error syncing to Notion:", error);
