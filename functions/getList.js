@@ -3,18 +3,26 @@ import { chromium } from "playwright";
 import * as cheerio from "cheerio";
 import parseBookPane from "../utils/parseBookPane.js";
 
-const USERNAME = process.env.USERNAME || "seaw457";
+// Hardcoded fallback guarantees navigation never hits /undefined or /***
+const FALLBACK_USERNAME = "seaw457";
+const RAW_USERNAME = process.env.USERNAME ? process.env.USERNAME.trim() : "";
+const USERNAME = RAW_USERNAME && RAW_USERNAME !== "***" ? RAW_USERNAME : FALLBACK_USERNAME;
 
 const createStorygraphUrl = (target, username) => {
-  const cleanUser = username ? username.trim().replace(/^\/+|\/+$/g, "") : "seaw457";
-  return `https://app.thestorygraph.com/${target}/${cleanUser}`;
+  const handle = username && username !== "***" ? username : FALLBACK_USERNAME;
+  // Appending ?view=list forces StoryGraph to server-render full book cards on public lists
+  return `https://app.thestorygraph.com/${target}/${handle}?view=list`;
 };
 
 const fetchAllBookPanes = async (target, username, limit = Infinity) => {
   const allBookPanes = [];
   const browser = await chromium.launch({
     headless: true,
-    args: ["--no-sandbox", "--disable-setuid-sandbox"],
+    args: [
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-blink-features=AutomationControlled",
+    ],
   });
 
   const context = await browser.newContext({
@@ -28,41 +36,31 @@ const fetchAllBookPanes = async (target, username, limit = Infinity) => {
 
   try {
     console.log(`[SCRAPER] Navigating to ${url}...`);
-    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+    const response = await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
 
-    // Explicitly wait for dynamic Turbo Frame content to populate
-    try {
-      await page.waitForFunction(
-        () => {
-          const frame = document.querySelector("turbo-frame");
-          const cards = document.querySelectorAll(".book-pane, .search-results-item, .book-title-author-and-series");
-          // Return true if cards exist or if turbo-frame has finished loading content
-          return cards.length > 0 || (frame && !frame.hasAttribute("busy") && frame.children.length > 0);
-        },
-        { timeout: 15000 }
-      );
-    } catch (e) {
-      console.log(`[SCRAPER] Turbo-frame wait non-fatal timeout on ${target}. Proceeding to DOM evaluation...`);
+    if (response && response.status() === 404) {
+      console.error(`[SCRAPER] Page 404 at ${url}. Check handle '${username}'.`);
+      return [];
     }
+
+    // Wait 3 seconds for initial DOM hydration
+    await page.waitForTimeout(3000);
+
+    // Scroll to bottom to trigger lazy rendering of card covers and pagination
+    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+    await page.waitForTimeout(1000);
 
     let hasNextPage = true;
     let pageCount = 1;
 
     while (hasNextPage && allBookPanes.length < limit) {
-      // Allow DOM updates to settle
-      await page.waitForTimeout(1500);
-
-      // Primary card selectors
+      // Primary card selectors (same ones that successfully captured to-read)
       await page
         .waitForSelector(
           ".book-pane, .search-results-item, .book-title-author-and-series, .book-pane-wrapper",
           { timeout: 10000 }
         )
         .catch(() => {});
-
-      // Scroll for pagination & image lazy loads
-      await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-      await page.waitForTimeout(1000);
 
       // Extract raw HTML card elements
       const paneHtmls = await page.$$eval(         ".book-pane, .search-results-item, .book-pane-wrapper",         (elements) => elements.map((el) => el.outerHTML)       );        let finalPaneHtmls = paneHtmls;       if (finalPaneHtmls.length === 0) {         finalPaneHtmls = await page.$$eval(".book-title-author-and-series", (elements) =>
@@ -92,7 +90,7 @@ const fetchAllBookPanes = async (target, username, limit = Infinity) => {
         }
       }
 
-      // Pagination matching (identical to working to-read logic)
+      // Pagination selector matching active "Next" buttons
       const paginationSelector =
         ".pagination .next a:not(.disabled), .pagination a[rel='next']:not(.disabled), a.next_page:not(.disabled)";
 
@@ -122,7 +120,7 @@ const fetchAllBookPanes = async (target, username, limit = Infinity) => {
           }),
         ]);
 
-        await page.waitForTimeout(2000);
+        await page.waitForTimeout(2500);
       } else {
         console.log(`[SCRAPER] No active 'Next' button found. Finished scraping ${target}.`);
         hasNextPage = false;
