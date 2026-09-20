@@ -3,7 +3,7 @@ import * as cheerio from "cheerio";
 export default function parseBookPane($pane) {
   const BASE_URL = "https://app.thestorygraph.com";
 
-  // Helper to construct valid absolute URLs
+  // Formats relative URLs into full HTTPS links for Notion embedding
   const formatUrl = (rawUrl) => {
     if (!rawUrl) return undefined;
     if (rawUrl.startsWith("http://") || rawUrl.startsWith("https://")) {
@@ -12,7 +12,7 @@ export default function parseBookPane($pane) {
     return `${BASE_URL}${rawUrl.startsWith("/") ? "" : "/"}${rawUrl}`;
   };
 
-  // Extract book ID from href
+  // Extract StoryGraph book ID
   const rawBookLink = $pane.find("a[href*='/books/']").first().attr("href") || "";
   const idMatch = rawBookLink.match(/\/books\/([a-zA-Z0-9-]+)/);
   const id = idMatch ? idMatch[1] : undefined;
@@ -49,7 +49,7 @@ export default function parseBookPane($pane) {
       const text = cheerio.load(el).root().text().trim();
       if (/^(Read|Finished)/i.test(text)) {
         rawDateText = text;
-        return false; // Exit loop on first match
+        return false;
       }
     });
   }
@@ -62,7 +62,7 @@ export default function parseBookPane($pane) {
     }
   }
 
-  // Extract Rating
+  // Extract Rating (strictly 0.0 - 5.0)
   let rating = undefined;
   const ratingNode = $pane.find(".star-rating, .rating, [aria-label*='stars']").first();
   const ratingText = ratingNode.attr("aria-label") || ratingNode.text().trim() || "";
@@ -72,7 +72,7 @@ export default function parseBookPane($pane) {
     if (num <= 5) rating = num;
   }
 
-  // Extract Genres
+  // Extract Genres (safely loaded via Cheerio instances)
   const genreTags = [];
   $pane.find(".tag, .genre-tag, a[href*='/genres/']").each((_, el) => {
     const tag = cheerio.load(el).root().text().trim().replace(/,/g, "");
