@@ -1,115 +1,168 @@
+import "dotenv/config";
+import { chromium } from "playwright";
 import * as cheerio from "cheerio";
+import parseBookPane from "../utils/parseBookPane.js";
 
-export default function parseBookPane($pane) {
-  const BASE_URL = "https://app.thestorygraph.com";
+const HARDCODED_USERNAME = "seaw457";
 
-  const formatUrl = (rawUrl) => {
-    if (!rawUrl || rawUrl.startsWith("data:image")) return undefined;
-    
-    // Clean potential srcset descriptors like "https://... 2x" or ", https://..."
-    let cleanUrl = rawUrl.trim().split(",")[0].split(" ")[0];
-    
-    if (cleanUrl.startsWith("http://") || cleanUrl.startsWith("https://")) {
-      return cleanUrl;
+const createStorygraphUrl = (target) => {
+  if (target === "currently-reading") {
+    return `https://app.thestorygraph.com/profile/${HARDCODED_USERNAME}`;
+  }
+  if (target === "books-read") {
+    return `https://app.thestorygraph.com/books-read/${HARDCODED_USERNAME}`;
+  }
+  return `https://app.thestorygraph.com/${target}/${HARDCODED_USERNAME}`;
+};
+
+const fetchAllBookPanes = async (target, limit = Infinity) => {
+  const allBookPanes = [];
+  const browser = await chromium.launch({
+    headless: true,
+    args: ["--no-sandbox", "--disable-setuid-sandbox"],
+  });
+
+  const context = await browser.newContext({
+    viewport: { width: 1280, height: 1000 },
+    userAgent:
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+  });
+
+  const page = await context.newPage();
+  const url = createStorygraphUrl(target);
+
+  try {
+    console.log(`[SCRAPER] Navigating to ${url}...`);
+    const response = await page.goto(url, { waitUntil: "domcontentloaded", timeout: 35000 });
+
+    if (response && response.status() === 404) {
+      console.error(`[SCRAPER] Page returned 404 at ${url}.`);
+      return [];
     }
-    return `${BASE_URL}${cleanUrl.startsWith("/") ? "" : "/"}${cleanUrl}`;
-  };
 
-  const rawBookLink = $pane.find("a[href*='/books/']").first().attr("href") || "";
-  const idMatch = rawBookLink.match(/\/books\/([a-zA-Z0-9-]+)/);
-  const id = idMatch ? idMatch[1] : undefined;
+    await page.waitForTimeout(3000);
 
-  const title =
-    $pane.find(".book-title-author-and-series a").first().text().trim() ||
-    $pane.find("a[href*='/books/']").first().text().trim() ||
-    $pane.find(".title").text().trim() ||
-    "Untitled Book";
+    let hasNextPage = true;
+    let pageCount = 1;
 
-  const author =
-    $pane.find("a[href*='/authors/']").first().text().trim() ||
-    $pane.find(".author").text().trim() ||
-    "Unknown Author";
+    while (hasNextPage && allBookPanes.length < limit) {
+      // Incremental smooth scroll to force lazy-loaded elements to hydrate
+      await page.evaluate(async () => {
+        for (let i = 0; i < document.body.scrollHeight; i += 300) {
+          window.scrollTo(0, i);
+          await new Promise((res) => setTimeout(res, 50));
+        }
+      });
+      await page.waitForTimeout(1000);
 
-  // ENHANCED COVER PICKER
-  const imgNode = $pane.find("img.book-cover, img[src*='amazon'], img[data-src], img").first();
-  const rawCover =
-    imgNode.attr("data-src") ||
-    imgNode.attr("data-lazy-src") ||
-    imgNode.attr("srcset") ||
-    imgNode.attr("src") ||
-    "";
-  
-  const cover = formatUrl(rawCover);
+      // Enhanced selector matching both list pages and profile widgets
+      const cardSelector = target === "currently-reading"
+        ? ".currently-reading-cover-wrapper, .book-pane, .book-pane-wrapper, div:has(> a[href*='/books/'])"
+        : ".book-pane, .search-results-item, .book-pane-wrapper";
 
-  let dateRead = undefined;
-  const dateElement = $pane.find(".read-date, .date-read, p.read-date-text").first();
-  let rawDateText = "";
+      await page.waitForSelector(cardSelector, { timeout: 10000 }).catch(() => {});
 
-  if (dateElement.length) {
-    rawDateText = dateElement.text().trim();
-  } else {
-    // Optimized: Use $(el) instead of cheerio.load(el)$pane.find("p, span").each((_, el) => {
-      const text = $pane.find(el).text().trim();
-      if (/^(Read|Finished)/i.test(text)) {
-        rawDateText = text;
-        return false; // Break loop
+      const paneHtmls = await page.$$eval(cardSelector, (elements) =>
+        elements
+          .map((el) => {
+            const card =
+              el.closest(".book-pane") ||
+              el.closest(".search-results-item") ||
+              el.closest(".book-pane-wrapper") ||
+              el.closest(".currently-reading-cover-wrapper") ||
+              el;
+            return card ? card.outerHTML : "";
+          })
+          .filter(Boolean)
+      );
+
+      const uniquePanes = [...new Set(paneHtmls)].filter(Boolean);
+      console.log(`[SCRAPER] Page ${pageCount}: Found ${uniquePanes.length} books in ${target}.`);
+
+      if (uniquePanes.length === 0) {
+        hasNextPage = false;
+        break;
       }
-    });
+
+      for (const html of uniquePanes) {
+        if (allBookPanes.length < limit) {
+          const $ = cheerio.load(html);
+          allBookPanes.push($.root());
+        }
+      }
+
+      // Profile page doesn't have list pagination
+      if (target === "currently-reading") {
+        hasNextPage = false;
+        break;
+      }
+
+      const paginationSelector =
+        ".pagination .next a, .pagination a[rel='next'], a.next_page, .pagination a:has-text('›'), .pagination a:has-text('Next'), a[href*='page=']";
+
+      const nextButton = await page.$(paginationSelector);
+
+      if (nextButton && allBookPanes.length < limit) {
+        const isVisible = await nextButton.isVisible().catch(() => false);
+        const isDisabled = await page.evaluate(
+          (el) => el.classList.contains("disabled") || el.getAttribute("aria-disabled") === "true",
+          nextButton
+        );
+
+        if (!isVisible || isDisabled) {
+          console.log(`[SCRAPER] Reached last page for ${target}.`);
+          hasNextPage = false;
+          break;
+        }
+
+        pageCount++;
+        console.log(`[SCRAPER] Clicking Next button for Page ${pageCount}...`);
+
+        await nextButton.scrollIntoViewIfNeeded().catch(() => {});
+
+        await Promise.all([
+          page.waitForResponse((resp) => resp.status() === 200, { timeout: 10000 }).catch(() => {}),
+          nextButton.click({ timeout: 5000 }).catch(async () => {
+            await page.evaluate((sel) => {
+              const el = document.querySelector(sel);
+              if (el) el.click();
+            }, paginationSelector);
+          }),
+        ]);
+
+        await page.waitForTimeout(2500);
+      } else {
+        console.log(`[SCRAPER] No active 'Next' button found. Finished scraping ${target}.`);
+        hasNextPage = false;
+      }
+    }
+  } catch (err) {
+    console.error(`[SCRAPER] Error while scraping ${url}:`, err.message);
+  } finally {
+    await browser.close();
   }
 
-  if (rawDateText) {
-    // Fix: Use word boundaries so "January" isn't modified to "Ja uary"
-    const cleanDate = rawDateText.replace(/\b(Read|Finished|in)\b/gi, "").trim();
-    const parsedDate = new Date(cleanDate);
-    if (!isNaN(parsedDate.getTime())) {
-      dateRead = parsedDate.toISOString().split("T")[0];
-    }
+  return allBookPanes;
+};
+
+export const handler = async (req) => {
+  const target = req.queryStringParameters?.target || "books-read";
+  const limit = req.queryStringParameters?.limit || Infinity;
+
+  try {
+    const bookPanes = await fetchAllBookPanes(target, limit);
+    const data = bookPanes.map((pane) => parseBookPane(pane));
+
+    return {
+      statusCode: 200,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data),
+    };
+  } catch (error) {
+    console.error("Error:", error);
+    return {
+      statusCode: 500,
+      body: JSON.stringify({ error: error.message }),
+    };
   }
-
-  let rating = undefined;
-  const ratingNode = $pane.find(".star-rating, .rating, [aria-label*='stars']").first();
-  const ratingText = ratingNode.attr("aria-label") || ratingNode.text().trim() || "";
-  const ratingMatch = ratingText.match(/(\d+(?:\.\d+)?)\s*(?:out of 5|stars)?/i);
-  if (ratingMatch) {
-    const num = parseFloat(ratingMatch[1]);
-    if (num <= 5) rating = num;
-  }
-
-  // Common StoryGraph UI noise to ignore
-  const UI_BLACKLIST = ["edit", "filter", "add to list", "view all", "remove"];
-
-  const genreTags = [];
-  $pane.find(".tag, .genre-tag, a[href*='/genres/']").each((_, el) => {
-    const tag = $pane.find(el).text().trim().replace(/,/g, "");
-    const lowerTag = tag.toLowerCase();
-    
-    if (
-      tag &&
-      !genreTags.includes(tag) &&
-      tag.length < 50 &&
-      !UI_BLACKLIST.includes(lowerTag)
-    ) {
-      genreTags.push(tag);
-    }
-  });
-
-  const moodTags = [];
-  $pane.find(".mood-tag, a[href*='/moods/']").each((_, el) => {
-    const mood = $pane.find(el).text().trim().replace(/,/g, "");
-    if (mood && !moodTags.includes(mood) && mood.length < 50) {
-      moodTags.push(mood);
-    }
-  });
-
-  let pageCount = undefined;
-  $pane.find("p, span, div").each((_, el) => {
-    const txt = $pane.find(el).text().trim();
-    const match = txt.match(/(\d{1,5})\s*pages?/i);
-    if (match) {
-      pageCount = parseInt(match[1], 10);
-      return false; // Break loop
-    }
-  });
-
-  return { id, title, author, cover, dateRead, rating, genreTags, moodTags, pageCount };
-}
+};
