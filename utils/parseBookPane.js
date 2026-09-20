@@ -4,7 +4,7 @@ export default function parseBookPane($pane) {
   const BASE_URL = "https://app.thestorygraph.com";
 
   const formatUrl = (rawUrl) => {
-    if (!rawUrl) return undefined;
+    if (!rawUrl || rawUrl.startsWith("data:image")) return undefined;
     if (rawUrl.startsWith("http://") || rawUrl.startsWith("https://")) {
       return rawUrl;
     }
@@ -26,10 +26,15 @@ export default function parseBookPane($pane) {
     $pane.find(".author").text().trim() ||
     "Unknown Author";
 
+  // ENHANCED COVER PICKER: Inspects data-src, srcset, and src for actual image URLs
+  const imgNode = $pane.find("img.book-cover, img[src*='amazon'], img[data-src], img").first();
   const rawCover =
-    $pane.find("img.book-cover").attr("src") ||
-    $pane.find("img").attr("src") ||
+    imgNode.attr("data-src") ||
+    imgNode.attr("data-lazy-src") ||
+    (imgNode.attr("srcset") ? imgNode.attr("srcset").split(" ")[0] : undefined) ||
+    imgNode.attr("src") ||
     "";
+  
   const cover = formatUrl(rawCover);
 
   let dateRead = undefined;
