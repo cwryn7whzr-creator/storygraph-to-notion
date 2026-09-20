@@ -16,7 +16,6 @@ async function addBookToNotion(book, listType) {
   }
 
   try {
-    // Search Notion database by Title
     const response = await notion.databases.query({
       database_id: databaseId,
       filter: {
@@ -57,8 +56,43 @@ async function addBookToNotion(book, listType) {
               url: book.cover || book.bookCoverStoryGraphUrl,
             }
           : undefined,
+      "Date Read": book.dateRead
+        ? {
+            date: {
+              start: book.dateRead,
+            },
+          }
+        : undefined,
+      Rating:
+        book.rating !== undefined
+          ? {
+              number: book.rating,
+            }
+          : undefined,
+      Genres:
+        book.genreTags && book.genreTags.length > 0
+          ? {
+              multi_select: book.genreTags
+                .map((tag) => ({ name: tag }))
+                .slice(0, 10),
+            }
+          : undefined,
+      Moods:
+        book.moodTags && book.moodTags.length > 0
+          ? {
+              multi_select: book.moodTags
+                .map((tag) => ({ name: tag }))
+                .slice(0, 10),
+            }
+          : undefined,
+      "Page Count": book.pageCount
+        ? {
+            number: Number(book.pageCount),
+          }
+        : undefined,
     };
 
+    // Safely remove undefined fields before calling Notion API
     Object.keys(bookProperties).forEach(
       (key) => bookProperties[key] === undefined && delete bookProperties[key]
     );
