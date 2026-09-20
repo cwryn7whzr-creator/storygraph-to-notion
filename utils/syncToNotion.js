@@ -49,12 +49,12 @@ async function addBookToNotion(book, listType) {
           name: listTypeToStatus(listType),
         },
       },
-      // UPDATED: Formatted as a Notion "Files & Media" property
+      // UPDATED: Truncated file name to satisfy Notion API 100-character limit
       "Cover Image": book.cover
         ? {
             files: [
               {
-                name: `${book.title || "Book"} Cover`,
+                name: `${book.title || "Book"} Cover`.slice(0, 100),
                 type: "external",
                 external: {
                   url: book.cover,
