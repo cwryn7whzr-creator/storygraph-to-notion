@@ -16,6 +16,14 @@ const BOOK_SELECTOR =
   ".book-pane, .search-results-item, .book-pane-wrapper, .book-title-author-and-series";
 const PROFILE_SELECTOR = ".currently-reading-cover-wrapper, .currently-reading-title-author";
 
+// Squeezes HTML down so it is readable in the GitHub log: collapses whitespace,
+// and replaces giant inline data: images with a short placeholder.
+const compactHtml = (html, max) =>
+  html
+    .replace(/(src|srcset)="data:[^"]*"/g, '$1="data:..."')
+    .replace(/\s+/g, " ")
+    .slice(0, max);
+
 // Where to look for each list. Currently-reading tries its own list page first
 // (same layout as the other lists), then falls back to the profile page.
 const buildSources = (target) => {
@@ -144,8 +152,13 @@ const countBookLinks = (page) =>
 // Storygraph lists use infinite scroll: more books appear as you scroll down.
 // Keep scrolling to the bottom until the number of books stops growing (or we
 // reach the expected total), then make sure the cover images have loaded.
+//
+// options.waitForImages (default true): set to false when only book IDs are
+// needed (mood/genre segment pages), which saves 10+ seconds per page.
 // ---------------------------------------------------------------------------
-export const loadEverythingOnPage = async (page, expectedTotal, label) => {
+export const loadEverythingOnPage = async (page, expectedTotal, label, options = {}) => {
+  const { waitForImages = true } = options;
+
   let last = await countBookLinks(page);
   let stable = 0;
   let rounds = 0;
@@ -177,6 +190,8 @@ export const loadEverythingOnPage = async (page, expectedTotal, label) => {
     `[SCRAPER] ${label}: scrolling loaded ${last} books in ${rounds} rounds` +
       (expectedTotal ? ` (expected ${expectedTotal})` : "")
   );
+
+  if (!waitForImages) return;
 
   // Final slow pass from the top so every lazy-loaded cover image gets a chance to load.
   await page.evaluate(async () => {
@@ -392,6 +407,8 @@ const scrapeSource = async (page, source, limit) => {
           .map((c) => c.html)
           .join("\n\n<!-- ---------- next card ---------- -->\n\n")
       );
+      // Also print one card into the log so it can be copied without downloading artifacts.
+      console.log(`[SAMPLE-HTML] ${tag}: ${compactHtml(cards[0].html, 6000)}`);
     }
 
     // Save a few cards that have no usable cover image.
