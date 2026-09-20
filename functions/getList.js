@@ -5,6 +5,7 @@ import parseBookPane from "../utils/parseBookPane.js";
 
 const HARDCODED_USERNAME = "seaw457";
 
+// Mirrored URL creation: exact same string pattern for all lists
 const createStorygraphUrl = (target) => {
   if (target === "currently-reading") {
     return `https://app.thestorygraph.com/profile/${HARDCODED_USERNAME}`;
@@ -26,6 +27,8 @@ const fetchAllBookPanes = async (target, username, limit = Infinity) => {
   });
 
   const page = await context.newPage();
+  
+  // Force exact clean URL without relying on env variables
   const url = createStorygraphUrl(target);
 
   try {
@@ -37,24 +40,24 @@ const fetchAllBookPanes = async (target, username, limit = Infinity) => {
       return [];
     }
 
+    // Identical wait and scroll strategy that successfully rendered 'to-read'
     await page.waitForTimeout(3000);
+    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight / 2));
+    await page.waitForTimeout(500);
+    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+    await page.waitForTimeout(1000);
 
     let hasNextPage = true;
     let pageCount = 1;
 
     while (hasNextPage && allBookPanes.length < limit) {
-      await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight / 2));
-      await page.waitForTimeout(500);
-      await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-      await page.waitForTimeout(1000);
-
+      // Unified selector strategy covering all storygraph book pane variants
       const cardSelector =
-        target === "currently-reading"
-          ? ".currently-reading-cover-wrapper, .book-pane, .search-results-item"
-          : ".book-pane, .search-results-item, .book-pane-wrapper";
+        ".book-pane, .search-results-item, .book-pane-wrapper, .currently-reading-cover-wrapper, .book-title-author-and-series";
 
       await page.waitForSelector(cardSelector, { timeout: 10000 }).catch(() => {});
 
+      // Mirroring the exact DOM extraction logic used for 'to-read'
       const paneHtmls = await page.$$eval(cardSelector, (elements) =>
         elements
           .map((el) => {
@@ -83,11 +86,13 @@ const fetchAllBookPanes = async (target, username, limit = Infinity) => {
         }
       }
 
+      // 'currently-reading' on the profile page displays as a complete grid without pagination
       if (target === "currently-reading") {
         hasNextPage = false;
         break;
       }
 
+      // Unified pagination matching across multi-page lists ('books-read' & 'to-read')
       const paginationSelector =
         ".pagination .next a, .pagination a[rel='next'], a.next_page, .pagination a:has-text('›'), .pagination a:has-text('Next'), a[href*='page=']";
 
