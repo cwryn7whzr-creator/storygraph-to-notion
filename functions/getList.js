@@ -32,27 +32,25 @@ const fetchAllBookPanes = async (target, username, limit = Infinity) => {
     let pageCount = 1;
 
     while (hasNextPage && allBookPanes.length < limit) {
-      // Wait for book cards to appear in the DOM
       await page
-        .waitForSelector(".book-pane, .book-title-author-and-series", { timeout: 10000 })
-        .catch(() => {});
+        .waitForSelector(".book-pane, .search-results-item, .book-title-author-and-series", {
+          timeout: 15000,
+        })
+        .catch(() => console.log(`[SCRAPER] Timeout waiting for cards on page ${pageCount}`));
 
-      // Scroll down to the bottom where pagination controls sit
       await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-      await page.waitForTimeout(1000);
+      await page.waitForTimeout(1500);
 
-      // Extract current page's HTML book cards
-      const paneHtmls = await page.$$eval(
-        ".book-pane, .book-title-author-and-series",
-        (elements) =>
+      const paneHtmls = await page.$$eval(         ".book-pane, .search-results-item",         (elements) => elements.map((el) => el.outerHTML)       );        let finalPaneHtmls = paneHtmls;       if (finalPaneHtmls.length === 0) {         finalPaneHtmls = await page.$$eval(".book-title-author-and-series", (elements) =>
           elements.map((el) => {
-            const card = el.closest(".book-pane") || el.closest(".search-results-item") || el;
-            return card.outerHTML;
+            const parent = el.closest(".book-pane") || el.closest(".search-results-item") || el.parentElement;
+            return parent ? parent.outerHTML : el.outerHTML;
           })
-      );
+        );
+      }
 
-      const uniquePanes = [...new Set(paneHtmls)].filter(Boolean);
-      console.log(`[SCRAPER] Page ${pageCount}: Found ${uniquePanes.length} books.`);
+      const uniquePanes = [...new Set(finalPaneHtmls)].filter(Boolean);
+      console.log(`[SCRAPER] Page ${pageCount}: Found ${uniquePanes.length} books in ${target}.`);
 
       if (uniquePanes.length === 0) {
         hasNextPage = false;
@@ -66,20 +64,20 @@ const fetchAllBookPanes = async (target, username, limit = Infinity) => {
         }
       }
 
-      // Comprehensive selector matching StoryGraph's pagination elements
-      const nextButton = await page.$(
-        ".pagination .next a, .pagination a[rel='next'], a.next_page, [aria-label*='next' i], .pagination a:has-text('›'), .pagination a:has-text('»'), .pagination a:has-text('>')"
-      );
+      const paginationSelector =
+        ".pagination .next a, .pagination a[rel='next'], a.next_page, [aria-label*='next' i], .pagination a:has-text('›'), .pagination a:has-text('»')";
+
+      const nextButton = await page.$(paginationSelector);
 
       if (nextButton && allBookPanes.length < limit) {
-        // Verify the next button is active and not disabled
+        const isVisible = await nextButton.isVisible().catch(() => false);
         const isDisabled = await page.evaluate(
           (el) => el.classList.contains("disabled") || el.getAttribute("aria-disabled") === "true",
           nextButton
         );
 
-        if (isDisabled) {
-          console.log(`[SCRAPER] Next button is disabled. Reached last page for ${target}.`);
+        if (!isVisible || isDisabled) {
+          console.log(`[SCRAPER] Reached end of pagination for ${target}.`);
           hasNextPage = false;
           break;
         }
@@ -87,12 +85,19 @@ const fetchAllBookPanes = async (target, username, limit = Infinity) => {
         pageCount++;
         console.log(`[SCRAPER] Clicking Next button for Page ${pageCount}...`);
 
+        await nextButton.scrollIntoViewIfNeeded().catch(() => {});
+
         await Promise.all([
           page.waitForResponse((resp) => resp.status() === 200, { timeout: 10000 }).catch(() => {}),
-          nextButton.click(),
+          nextButton.click({ timeout: 5000 }).catch(async () => {
+            await page.evaluate((sel) => {
+              const el = document.querySelector(sel);
+              if (el) el.click();
+            }, paginationSelector);
+          }),
         ]);
 
-        await page.waitForTimeout(2000); // Allow Turbo response to stream into DOM
+        await page.waitForTimeout(2500);
       } else {
         console.log(`[SCRAPER] No active 'Next' button found. Finished scraping ${target}.`);
         hasNextPage = false;
