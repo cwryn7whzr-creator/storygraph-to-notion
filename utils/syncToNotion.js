@@ -92,6 +92,7 @@ async function addBookToNotion(book, listType) {
         : undefined,
     };
 
+    // Strip undefined properties to ensure valid Notion payloads
     Object.keys(bookProperties).forEach(
       (key) => bookProperties[key] === undefined && delete bookProperties[key]
     );
