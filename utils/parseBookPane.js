@@ -3,6 +3,7 @@ import * as cheerio from "cheerio";
 export default function parseBookPane($pane) {
   const BASE_URL = "https://app.thestorygraph.com";
 
+  // Helper to construct valid absolute URLs
   const formatUrl = (rawUrl) => {
     if (!rawUrl) return undefined;
     if (rawUrl.startsWith("http://") || rawUrl.startsWith("https://")) {
@@ -11,32 +12,47 @@ export default function parseBookPane($pane) {
     return `${BASE_URL}${rawUrl.startsWith("/") ? "" : "/"}${rawUrl}`;
   };
 
+  // Extract book ID from href
   const rawBookLink = $pane.find("a[href*='/books/']").first().attr("href") || "";
   const idMatch = rawBookLink.match(/\/books\/([a-zA-Z0-9-]+)/);
   const id = idMatch ? idMatch[1] : undefined;
 
+  // Extract Title
   const title =
     $pane.find(".book-title-author-and-series a").first().text().trim() ||
     $pane.find("a[href*='/books/']").first().text().trim() ||
     $pane.find(".title").text().trim() ||
     "Untitled Book";
 
+  // Extract Author
   const author =
     $pane.find("a[href*='/authors/']").first().text().trim() ||
     $pane.find(".author").text().trim() ||
     "Unknown Author";
 
+  // Extract Cover Image URL
   const rawCover =
     $pane.find("img.book-cover").attr("src") ||
     $pane.find("img").attr("src") ||
     "";
   const cover = formatUrl(rawCover);
 
+  // Extract Read Date
   let dateRead = undefined;
   const dateElement = $pane.find(".read-date, .date-read, p.read-date-text").first();
-  const rawDateText = dateElement.length
-    ? dateElement.text().trim()
-    : $pane.find("p").filter((_, el) => /^(Read\vert{}Finished)/i.test($pane(el).text().trim())).first().text().trim();
+  let rawDateText = "";
+
+  if (dateElement.length) {
+    rawDateText = dateElement.text().trim();
+  } else {
+    $pane.find("p").each((_, el) => {
+      const text = cheerio.load(el).root().text().trim();
+      if (/^(Read|Finished)/i.test(text)) {
+        rawDateText = text;
+        return false; // Exit loop on first match
+      }
+    });
+  }
 
   if (rawDateText) {
     const cleanDate = rawDateText.replace(/Read|Finished|in/gi, "").trim();
@@ -46,6 +62,7 @@ export default function parseBookPane($pane) {
     }
   }
 
+  // Extract Rating
   let rating = undefined;
   const ratingNode = $pane.find(".star-rating, .rating, [aria-label*='stars']").first();
   const ratingText = ratingNode.attr("aria-label") || ratingNode.text().trim() || "";
@@ -55,24 +72,25 @@ export default function parseBookPane($pane) {
     if (num <= 5) rating = num;
   }
 
+  // Extract Genres
   const genreTags = [];
   $pane.find(".tag, .genre-tag, a[href*='/genres/']").each((_, el) => {
-    const $el = cheerio.load(el).root();
-    const tag = $el.text().trim().replace(/,/g, "");
+    const tag = cheerio.load(el).root().text().trim().replace(/,/g, "");
     if (tag && !genreTags.includes(tag) && tag.length < 50) {
       genreTags.push(tag);
     }
   });
 
+  // Extract Moods
   const moodTags = [];
   $pane.find(".mood-tag, a[href*='/moods/']").each((_, el) => {
-    const $el = cheerio.load(el).root();
-    const mood = $el.text().trim().replace(/,/g, "");
+    const mood = cheerio.load(el).root().text().trim().replace(/,/g, "");
     if (mood && !moodTags.includes(mood) && mood.length < 50) {
       moodTags.push(mood);
     }
   });
 
+  // Extract Page Count
   let pageCount = undefined;
   $pane.find("p, span").each((_, el) => {
     const txt = cheerio.load(el).root().text().trim();
