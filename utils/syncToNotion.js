@@ -26,14 +26,12 @@ const stats = {
   duplicateMatches: 0,
 };
 
-const optionalProps = {
-  yearsRead: false,
-  timesRead: false,
-  yearRead: false,
-  storyGraphId: false,
-};
-
 let lastNotionRequestAt = 0;
+const reportedDuplicateGroups = new Set();
+
+// ---------------------------------------------------------------------------
+// Small text helpers
+// ---------------------------------------------------------------------------
 
 const clean = (value) =>
   String(value || "").replace(/\s+/g, " ").trim();
@@ -44,19 +42,21 @@ const normAuthor = (value) =>
     .replace(/[^a-z0-9]+/g, " ")
     .trim();
 
+// The same authors listed in a different order still count as the same list.
+const authorKey = (value) =>
+  normAuthor(value).split(" ").filter(Boolean).sort().join(" ");
+
+// The parser falls back to "Unknown Author" when it finds nothing. That is a
+// placeholder, not data, so it must never overwrite or merge anything.
+const hasKnownAuthor = (book) =>
+  Boolean(book?.author) && book.author !== "Unknown Author";
+
 const validExternalUrl = (url) =>
   typeof url === "string" &&
   /^https?:\/\//i.test(url) &&
   url.length < 2000
     ? url
     : null;
-
-function guessImageContentType(url) {
-  if (/\.png(?:\?|$)/i.test(url)) return "image/png";
-  if (/\.webp(?:\?|$)/i.test(url)) return "image/webp";
-  if (/\.gif(?:\?|$)/i.test(url)) return "image/gif";
-  return "image/jpeg";
-}
 
 function safeCoverFilename(title, url) {
   const extension =
@@ -70,6 +70,18 @@ function safeCoverFilename(title, url) {
 
   return `${base}-cover.${extension}`;
 }
+
+const sameSet = (left, right) =>
+  left.length === right.length && left.every((item) => right.includes(item));
+
+const sortYearNames = (names) =>
+  [...names].sort(
+    (a, b) => Number(a) - Number(b) || String(a).localeCompare(String(b))
+  );
+
+// ---------------------------------------------------------------------------
+// Notion request wrapper: pacing + retry on rate limits
+// ---------------------------------------------------------------------------
 
 async function notionRequest(fn, label, attempt = 1) {
   const waitMs = Math.max(
@@ -118,6 +130,10 @@ async function notionRequest(fn, label, attempt = 1) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Reading values out of Notion pages
+// ---------------------------------------------------------------------------
+
 function getPlainText(property) {
   if (!property) {
     return "";
@@ -144,12 +160,6 @@ function getSelectName(property) {
     : null;
 }
 
-function getDateStart(property) {
-  return property?.type === "date"
-    ? property.date?.start || null
-    : null;
-}
-
 function getMultiSelectNames(property) {
   return property?.type === "multi_select"
     ? property.multi_select.map((item) => item.name).filter(Boolean)
@@ -172,27 +182,19 @@ function hasFilesProperty(property) {
   return property?.type === "files" && property.files?.length > 0;
 }
 
+// ---------------------------------------------------------------------------
+// Building values to send to Notion
+// ---------------------------------------------------------------------------
+
 function titleProperty(value) {
   return {
-    title: [
-      {
-        text: {
-          content: String(value).slice(0, 2000),
-        },
-      },
-    ],
+    title: [{ text: { content: String(value).slice(0, 2000) } }],
   };
 }
 
 function richTextProperty(value) {
   return {
-    rich_text: [
-      {
-        text: {
-          content: String(value).slice(0, 2000),
-        },
-      },
-    ],
+    rich_text: [{ text: { content: String(value).slice(0, 2000) } }],
   };
 }
 
@@ -207,9 +209,7 @@ function multiSelectProperty(values) {
 function coverPayload(url) {
   return {
     type: "external",
-    external: {
-      url,
-    },
+    external: { url },
   };
 }
 
@@ -226,8 +226,87 @@ function listTypeToStatus(listType) {
   }
 }
 
-function canUse(schema, propertyName, expectedType) {
-  return schema[propertyName]?.type === expectedType;
+// ---------------------------------------------------------------------------
+// Notion property names.
+//
+// Property names are matched ignoring capitalization, spaces and punctuation,
+// so "Storygraph ID" is found even though this script says "StoryGraph ID".
+// P maps a plain key to the name your database actually uses. A key is left
+// out when the property is missing or has the wrong type, and that value is
+// then skipped instead of failing the sync.
+// ---------------------------------------------------------------------------
+
+const PROPERTY_SPECS = {
+  title: { label: "Title", type: "title" },
+  author: { label: "Author", type: "rich_text" },
+  status: { label: "Status", type: "select" },
+  coverImage: { label: "Cover Image", type: "files" },
+  rating: { label: "Rating", type: "number" },
+  genres: { label: "Genres", type: "multi_select" },
+  moods: { label: "Moods", type: "multi_select" },
+  pageCount: { label: "Page Count", type: "number" },
+  yearsRead: { label: "Years Read", type: "multi_select" },
+  timesRead: { label: "Times Read", type: "number" },
+  yearRead: { label: "Year Read", type: "number", optional: true },
+  storyGraphId: { label: "StoryGraph ID", type: "rich_text", optional: true },
+};
+
+const P = {};
+
+const normPropName = (name) =>
+  String(name).toLowerCase().replace(/[^a-z0-9]/g, "");
+
+// pv = "property value": a page's value for one of the keys above.
+const pv = (page, key) => (P[key] ? page?.properties?.[P[key]] : undefined);
+
+function resolveProperties(schema) {
+  const entries = Object.entries(schema);
+
+  for (const [key, spec] of Object.entries(PROPERTY_SPECS)) {
+    let found;
+
+    if (spec.type === "title") {
+      // A database has exactly one title property, whatever it is called.
+      found = entries.find(([, definition]) => definition.type === "title");
+    } else {
+      const sameName = entries.filter(
+        ([name]) => normPropName(name) === normPropName(spec.label)
+      );
+
+      found = sameName.find(([, definition]) => definition.type === spec.type);
+
+      if (!found && sameName.length > 0) {
+        console.warn(
+          `[NOTION] Property "${sameName[0][0]}" exists but is type ` +
+            `"${sameName[0][1].type}", not "${spec.type}". ` +
+            `${spec.label} will be skipped.`
+        );
+        continue;
+      }
+    }
+
+    if (found) {
+      P[key] = found[0];
+
+      if (found[0] !== spec.label && spec.type !== "title") {
+        console.log(`[NOTION] Using property "${found[0]}" for ${spec.label}.`);
+      }
+    } else if (spec.optional) {
+      console.log(
+        `[NOTION] Optional "${spec.label}" ${spec.type} property not found; ` +
+          "that value is skipped."
+      );
+    } else {
+      console.warn(
+        `[NOTION] Property "${spec.label}" (${spec.type}) not found. ` +
+          "That value will be skipped."
+      );
+    }
+  }
+
+  if (!P.title) {
+    throw new Error("The Notion database has no title property.");
+  }
 }
 
 async function checkDatabaseProperties() {
@@ -236,66 +315,28 @@ async function checkDatabaseProperties() {
     "database schema retrieval"
   );
 
-  const schema = db.properties || {};
-
-  optionalProps.yearsRead =
-    schema["Years Read"]?.type === "multi_select";
-
-  optionalProps.timesRead =
-    schema["Times Read"]?.type === "number";
-
-  optionalProps.yearRead =
-    schema["Year Read"]?.type === "number";
-
-  optionalProps.storyGraphId =
-    schema["StoryGraph ID"]?.type === "rich_text";
-
-  const expectedProperties = {
-    Title: "title",
-    Author: "rich_text",
-    Status: "select",
-    "Cover Image": "files",
-    Rating: "number",
-    Genres: "multi_select",
-    Moods: "multi_select",
-    "Page Count": "number",
-  };
-
-  for (const [name, type] of Object.entries(expectedProperties)) {
-    if (schema[name]?.type !== type) {
-      console.warn(
-        `[NOTION] Property "${name}" is missing or is not type "${type}". ` +
-          "That value will be skipped."
-      );
-    }
-  }
-
-  if (!optionalProps.storyGraphId) {
-    console.log(
-      '[NOTION] Optional "StoryGraph ID" Rich text property not found; ID storage is skipped.'
-    );
-  }
-
-  return schema;
+  resolveProperties(db.properties || {});
 }
 
+// ---------------------------------------------------------------------------
+// Existing pages: preload once, index, and pick a canonical page
+// ---------------------------------------------------------------------------
+
 function pageCompleteness(page) {
-  const properties = page.properties || {};
   let score = 0;
 
-  if (getPlainText(properties.Title)) score += 2;
-  if (getPlainText(properties.Author)) score += 2;
-  if (getSelectName(properties.Status)) score += 1;
-  if (getNumber(properties.Rating) !== null) score += 1;
-  if (getDateStart(properties["Date Read"])) score += 1;
-  if (getMultiSelectNames(properties.Genres).length) score += 2;
-  if (getMultiSelectNames(properties.Moods).length) score += 2;
-  if (getNumber(properties["Page Count"]) !== null) score += 1;
-  if (getNumber(properties["Year Read"]) !== null) score += 1;
-  if (getMultiSelectNames(properties["Years Read"]).length) score += 2;
-  if (getNumber(properties["Times Read"]) !== null) score += 1;
-  if (getPlainText(properties["StoryGraph ID"])) score += 3;
-  if (hasFilesProperty(properties["Cover Image"])) score += 2;
+  if (getPlainText(pv(page, "title"))) score += 2;
+  if (getPlainText(pv(page, "author"))) score += 2;
+  if (getSelectName(pv(page, "status"))) score += 1;
+  if (getNumber(pv(page, "rating")) !== null) score += 1;
+  if (getMultiSelectNames(pv(page, "genres")).length) score += 2;
+  if (getMultiSelectNames(pv(page, "moods")).length) score += 2;
+  if (getNumber(pv(page, "pageCount")) !== null) score += 1;
+  if (getNumber(pv(page, "yearRead")) !== null) score += 1;
+  if (getMultiSelectNames(pv(page, "yearsRead")).length) score += 2;
+  if (getNumber(pv(page, "timesRead")) !== null) score += 1;
+  if (getPlainText(pv(page, "storyGraphId"))) score += 3;
+  if (hasFilesProperty(pv(page, "coverImage"))) score += 2;
   if (getPageCoverUrl(page)) score += 2;
 
   return score;
@@ -314,10 +355,35 @@ function chooseCanonicalPage(candidates) {
   })[0];
 }
 
+const addToIndex = (map, key, page) => {
+  const list = map.get(key) || [];
+  list.push(page);
+  map.set(key, list);
+};
+
+function indexPage(indexes, page) {
+  indexes.pages.push(page);
+
+  const title = getPlainText(pv(page, "title"));
+  const storyGraphId = getPlainText(pv(page, "storyGraphId"));
+
+  if (title) {
+    addToIndex(indexes.byExactTitle, title, page);
+    addToIndex(indexes.byNormTitle, normTitle(title), page);
+  }
+
+  if (storyGraphId) {
+    addToIndex(indexes.byStoryGraphId, storyGraphId, page);
+  }
+}
+
 async function loadExistingPages() {
-  const pages = [];
-  const byExactTitle = new Map();
-  const byStoryGraphId = new Map();
+  const indexes = {
+    pages: [],
+    byExactTitle: new Map(),
+    byNormTitle: new Map(),
+    byStoryGraphId: new Map(),
+  };
 
   let cursor = undefined;
 
@@ -333,142 +399,154 @@ async function loadExistingPages() {
     );
 
     for (const page of response.results) {
-      pages.push(page);
-
-      const properties = page.properties || {};
-      const title = getPlainText(properties.Title);
-      const storyGraphId = getPlainText(properties["StoryGraph ID"]);
-
-      if (title) {
-        const matches = byExactTitle.get(title) || [];
-        matches.push(page);
-        byExactTitle.set(title, matches);
-      }
-
-      if (storyGraphId) {
-        const matches = byStoryGraphId.get(storyGraphId) || [];
-        matches.push(page);
-        byStoryGraphId.set(storyGraphId, matches);
-      }
+      indexPage(indexes, page);
     }
 
     cursor = response.has_more ? response.next_cursor : undefined;
   } while (cursor);
 
-  console.log(`[NOTION] Loaded ${pages.length} existing pages.`);
+  console.log(`[NOTION] Loaded ${indexes.pages.length} existing pages.`);
 
-  return {
-    pages,
-    byExactTitle,
-    byStoryGraphId,
-  };
+  return indexes;
 }
 
 function sameAuthor(book, page) {
-  const existingAuthor = getPlainText(page.properties?.Author);
+  const existingAuthor = getPlainText(pv(page, "author"));
 
-  if (!book.author || !existingAuthor) {
+  if (!hasKnownAuthor(book) || !existingAuthor) {
     return false;
   }
 
   return normAuthor(book.author) === normAuthor(existingAuthor);
 }
 
-// Exact title matches win. StoryGraph ID is used next. A normalized-title
-// fallback is accepted only when author names also match exactly after
-// normalization. This avoids merging different books with similar titles.
+// Where both the book and the page have a StoryGraph ID, they must agree.
+function idsAgree(book, page) {
+  const pageId = getPlainText(pv(page, "storyGraphId"));
+
+  return !book.id || !pageId || book.id === pageId;
+}
+
+// Matching order:
+//   1. StoryGraph ID (reliable once the ID property is filled in)
+//   2. exact title (your existing behaviour; titles are never "cleaned up")
+//   3. normalized title + same author + agreeing IDs (punctuation/case variants)
+// Returns { page, duplicates } where duplicates are OTHER pages that matched
+// the same way. They are reported and merged into, never deleted.
 function findExistingPage(book, indexes) {
-  const exactMatches = indexes.byExactTitle.get(book.title) || [];
+  const splitCanonical = (matches, via) => {
+    const canonical = chooseCanonicalPage(matches);
 
-  if (exactMatches.length > 0) {
-    const canonical = chooseCanonicalPage(exactMatches);
-
-    if (exactMatches.length > 1) {
-      stats.duplicateMatches++;
-
-      console.warn(
-        `[DUPLICATE] Exact title "${book.title}" has ${exactMatches.length} ` +
-          `Notion pages. Keeping page ${canonical.id} as canonical ` +
-          `(data score ${pageCompleteness(canonical)}).`
-      );
-    }
-
-    return canonical;
-  }
+    return {
+      page: canonical,
+      duplicates: matches.filter((page) => page.id !== canonical.id),
+      via,
+    };
+  };
 
   if (book.id) {
     const idMatches = indexes.byStoryGraphId.get(book.id) || [];
 
     if (idMatches.length > 0) {
-      const canonical = chooseCanonicalPage(idMatches);
+      const result = splitCanonical(idMatches, "id");
+      const existingTitle = getPlainText(pv(result.page, "title"));
 
-      console.log(
-        `[MATCH] StoryGraph ID matched "${book.title}" to existing ` +
-          `"${getPlainText(canonical.properties?.Title)}".`
-      );
+      if (existingTitle !== book.title) {
+        console.log(
+          `[MATCH] StoryGraph ID matched "${book.title}" to existing ` +
+            `"${existingTitle}".`
+        );
+      }
 
-      return canonical;
+      return result;
     }
   }
 
-  const normalizedBookTitle = normTitle(book.title);
+  const exactMatches = indexes.byExactTitle.get(book.title) || [];
 
-  const safeSimilarMatches = indexes.pages.filter((page) => {
-    const existingTitle = getPlainText(page.properties?.Title);
+  if (exactMatches.length > 0) {
+    return splitCanonical(exactMatches, "title");
+  }
 
-    if (!existingTitle || normTitle(existingTitle) !== normalizedBookTitle) {
-      return false;
-    }
+  const similarMatches = (
+    indexes.byNormTitle.get(normTitle(book.title)) || []
+  ).filter((page) => sameAuthor(book, page) && idsAgree(book, page));
 
-    return sameAuthor(book, page);
-  });
-
-  if (safeSimilarMatches.length > 0) {
-    const canonical = chooseCanonicalPage(safeSimilarMatches);
-
-    stats.duplicateMatches++;
+  if (similarMatches.length > 0) {
+    const result = splitCanonical(similarMatches, "normalized");
 
     console.log(
       `[MATCH] Normalized title + author matched "${book.title}" to ` +
-        `"${getPlainText(canonical.properties?.Title)}" ` +
-        `(data score ${pageCompleteness(canonical)}).`
+        `"${getPlainText(pv(result.page, "title"))}" ` +
+        `(data score ${pageCompleteness(result.page)}).`
     );
 
-    return canonical;
+    return result;
   }
 
   return null;
 }
 
-function rememberPage(indexes, page) {
-  indexes.pages.push(page);
+// Safety net for title-based matching: say so when the author on the Notion
+// page clearly differs from StoryGraph's, so a wrong match can be spotted.
+function warnIfAuthorDiffers(book, page) {
+  const notionAuthor = getPlainText(pv(page, "author"));
 
-  const properties = page.properties || {};
-  const title = getPlainText(properties.Title);
-  const storyGraphId = getPlainText(properties["StoryGraph ID"]);
-
-  if (title) {
-    const matches = indexes.byExactTitle.get(title) || [];
-    matches.push(page);
-    indexes.byExactTitle.set(title, matches);
-  }
-
-  if (storyGraphId) {
-    const matches = indexes.byStoryGraphId.get(storyGraphId) || [];
-    matches.push(page);
-    indexes.byStoryGraphId.set(storyGraphId, matches);
+  if (
+    notionAuthor &&
+    hasKnownAuthor(book) &&
+    authorKey(notionAuthor) !== authorKey(book.author)
+  ) {
+    console.log(
+      `[CHECK] "${book.title}": Notion author "${notionAuthor}" differs from ` +
+        `StoryGraph author "${book.author}". Make sure this is the same book.`
+    );
   }
 }
 
-// Keeps intentional repeat reads. The book's displayed title is never
-// normalized or replaced; exact title remains the record key.
-function mergeRepeatBooks(books, listType) {
-  if (listType !== "books-read") {
-    return books;
+function reportDuplicates(book, canonical, duplicates) {
+  if (duplicates.length === 0 || reportedDuplicateGroups.has(canonical.id)) {
+    return;
   }
 
-  const byTitle = new Map();
+  reportedDuplicateGroups.add(canonical.id);
+  stats.duplicateMatches++;
+
+  console.warn(
+    `[DUPLICATE] "${book.title}" matches ${duplicates.length + 1} Notion ` +
+      `pages. Canonical (most complete, data score ` +
+      `${pageCompleteness(canonical)}): ${canonical.url}`
+  );
+
+  for (const duplicate of duplicates) {
+    console.warn(
+      `[DUPLICATE]   Left unchanged for manual review ` +
+        `(data score ${pageCompleteness(duplicate)}): ${duplicate.url}`
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Repeat reads (books-read only). One Notion page per book:
+//   Times Read = number of completed-read entries
+//   Years Read = every known year
+//   Year Read  = the most recent known year
+//
+// Entries are combined when they share a StoryGraph ID (the same book read
+// again). Entries with DIFFERENT IDs are combined only when the title is
+// identical AND the authors match too (different editions of one work), and
+// that is written to the log. Title alone is never enough.
+// ---------------------------------------------------------------------------
+
+function mergeRepeatBooks(books, listType) {
+  if (listType !== "books-read") {
+    return { books, editionMerges: [] };
+  }
+
   const merged = [];
+  const byId = new Map();
+  const byTitleAndAuthor = new Map();
+  const editionMerges = [];
 
   for (const book of books) {
     if (!book || !book.title || book.title === "Untitled Book") {
@@ -476,24 +554,42 @@ function mergeRepeatBooks(books, listType) {
       continue;
     }
 
-    const first = byTitle.get(book.title);
+    const authorPart = hasKnownAuthor(book) ? authorKey(book.author) : "";
+    const titleAuthorKey = authorPart ? `${book.title}|${authorPart}` : null;
 
-    if (!first) {
+    let target = book.id ? byId.get(book.id) : undefined;
+
+    if (!target && titleAuthorKey) {
+      target = byTitleAndAuthor.get(titleAuthorKey);
+
+      if (target && book.id && target.id && book.id !== target.id) {
+        editionMerges.push(book.title);
+      }
+    }
+
+    if (!target) {
       const copy = {
         ...book,
         timesRead: 1,
         yearsRead: book.yearRead ? [book.yearRead] : [],
       };
 
-      byTitle.set(book.title, copy);
       merged.push(copy);
+
+      if (book.id) byId.set(book.id, copy);
+      if (titleAuthorKey) byTitleAndAuthor.set(titleAuthorKey, copy);
+
       continue;
     }
 
-    first.timesRead++;
+    target.timesRead++;
 
-    if (book.yearRead && !first.yearsRead.includes(book.yearRead)) {
-      first.yearsRead.push(book.yearRead);
+    if (book.id && !byId.has(book.id)) {
+      byId.set(book.id, target);
+    }
+
+    if (book.yearRead && !target.yearsRead.includes(book.yearRead)) {
+      target.yearsRead.push(book.yearRead);
     }
 
     for (const field of [
@@ -506,24 +602,26 @@ function mergeRepeatBooks(books, listType) {
       "bookUrl",
     ]) {
       if (
-        first[field] === undefined ||
-        first[field] === null ||
-        first[field] === ""
+        target[field] === undefined ||
+        target[field] === null ||
+        target[field] === ""
       ) {
-        first[field] = book[field];
+        target[field] = book[field];
       }
     }
 
-    if (!first.genreTags?.length && book.genreTags?.length) {
-      first.genreTags = book.genreTags;
+    if (!target.genreTags?.length && book.genreTags?.length) {
+      target.genreTags = book.genreTags;
     }
 
-    if (!first.moodTags?.length && book.moodTags?.length) {
-      first.moodTags = book.moodTags;
+    if (!target.moodTags?.length && book.moodTags?.length) {
+      target.moodTags = book.moodTags;
     }
   }
 
-  for (const book of byTitle.values()) {
+  for (const book of merged) {
+    if (!book?.yearsRead) continue;
+
     book.yearsRead.sort((left, right) => left - right);
 
     book.yearRead = book.yearsRead.length
@@ -531,38 +629,63 @@ function mergeRepeatBooks(books, listType) {
       : undefined;
   }
 
-  return merged;
+  return { books: merged, editionMerges };
 }
 
-// Imports an external public image into Notion's file system. The returned
-// value is a file_upload object usable in a Files & media property.
-async function importCoverToNotion(imageUrl, title) {
-  const url = validExternalUrl(imageUrl);
+// ---------------------------------------------------------------------------
+// Covers
+//
+// Cover Image is a Files & media property. For a Gallery card preview it needs
+// a real image. We ask Notion to import the picture from StoryGraph's URL,
+// wait for the import to finish, then attach it. If the import fails we fall
+// back to attaching the direct image link, so the property is not left empty.
+// Existing covers are never replaced.
+// ---------------------------------------------------------------------------
 
-  if (!url) {
-    return null;
-  }
-
+async function importCoverToNotion(url, title) {
   try {
+    // content_type is left out on purpose: Notion works it out from the image.
     const upload = await notionRequest(
       () =>
         notion.fileUploads.create({
           mode: "external_url",
           filename: safeCoverFilename(title, url),
-          content_type: guessImageContentType(url),
           external_url: url,
         }),
       `import cover "${title}"`
     );
 
-    console.log(`[COVER] Imported cover for "${title}".`);
+    // Notion downloads the image in the background. Wait until it says done.
+    for (let attempt = 1; attempt <= 10; attempt++) {
+      let status;
 
-    return {
-      type: "file_upload",
-      file_upload: {
-        id: upload.id,
-      },
-    };
+      try {
+        const check = await notionRequest(
+          () => notion.fileUploads.retrieve({ file_upload_id: upload.id }),
+          `check cover import "${title}"`
+        );
+
+        status = check.status;
+      } catch {
+        // Cannot check status with this library version: attach optimistically.
+        return { type: "file_upload", file_upload: { id: upload.id } };
+      }
+
+      if (status === "uploaded") {
+        console.log(`[COVER] Imported cover for "${title}".`);
+        return { type: "file_upload", file_upload: { id: upload.id } };
+      }
+
+      if (status === "failed" || status === "expired") {
+        console.warn(`[COVER] Notion could not import the cover for "${title}" (${status}).`);
+        return null;
+      }
+
+      await delay(1500);
+    }
+
+    console.warn(`[COVER] Import for "${title}" did not finish in time.`);
+    return null;
   } catch (error) {
     console.warn(
       `[COVER] Could not import cover for "${title}": ${error.message}`
@@ -572,226 +695,302 @@ async function importCoverToNotion(imageUrl, title) {
   }
 }
 
-async function createBookProperties(book, listType, schema) {
+async function buildCoverFile(book) {
+  const url = validExternalUrl(book.cover);
+
+  if (!url) {
+    return null;
+  }
+
+  const imported = await importCoverToNotion(url, book.title);
+
+  if (imported) {
+    return imported;
+  }
+
+  console.warn(
+    `[COVER] Attaching the direct image link for "${book.title}" instead of an imported file.`
+  );
+
+  return {
+    type: "external",
+    name: safeCoverFilename(book.title, url),
+    external: { url },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// New pages
+// ---------------------------------------------------------------------------
+
+async function createBookProperties(book, listType) {
   const properties = {
-    Title: titleProperty(book.title),
+    [P.title]: titleProperty(book.title),
   };
 
-  if (canUse(schema, "Author", "rich_text") && book.author) {
-    properties.Author = richTextProperty(book.author);
+  if (P.author && hasKnownAuthor(book)) {
+    properties[P.author] = richTextProperty(book.author);
   }
 
-  if (canUse(schema, "Status", "select")) {
-    properties.Status = {
-      select: {
-        name: listTypeToStatus(listType),
-      },
-    };
+  if (P.status) {
+    properties[P.status] = { select: { name: listTypeToStatus(listType) } };
   }
 
-  // New records get an actual Notion-imported image in the Files & media
-  // property, which can be selected as the Gallery card preview.
-  if (
-    canUse(schema, "Cover Image", "files") &&
-    validExternalUrl(book.cover)
-  ) {
-    const coverUpload = await importCoverToNotion(
-      book.cover,
-      book.title
-    );
+  if (P.coverImage) {
+    const coverFile = await buildCoverFile(book);
 
-    if (coverUpload) {
-      properties["Cover Image"] = {
-        files: [coverUpload],
-      };
+    if (coverFile) {
+      properties[P.coverImage] = { files: [coverFile] };
     }
   }
 
-  if (canUse(schema, "Rating", "number") && book.rating !== undefined) {
-    properties.Rating = {
-      number: Number(book.rating),
-    };
+  if (P.rating && book.rating !== undefined) {
+    properties[P.rating] = { number: Number(book.rating) };
   }
 
-  if (
-    canUse(schema, "Genres", "multi_select") &&
-    book.genreTags?.length
-  ) {
-    properties.Genres = multiSelectProperty(book.genreTags.slice(0, 20));
+  if (P.genres && book.genreTags?.length) {
+    properties[P.genres] = multiSelectProperty(book.genreTags.slice(0, 20));
   }
 
-  if (
-    canUse(schema, "Moods", "multi_select") &&
-    book.moodTags?.length
-  ) {
-    properties.Moods = multiSelectProperty(book.moodTags.slice(0, 20));
+  if (P.moods && book.moodTags?.length) {
+    properties[P.moods] = multiSelectProperty(book.moodTags.slice(0, 20));
   }
 
-  if (canUse(schema, "Page Count", "number") && book.pageCount) {
-    properties["Page Count"] = {
-      number: Number(book.pageCount),
-    };
+  if (P.pageCount && book.pageCount) {
+    properties[P.pageCount] = { number: Number(book.pageCount) };
   }
 
-  if (optionalProps.yearRead && book.yearRead) {
-    properties["Year Read"] = {
-      number: Number(book.yearRead),
-    };
+  if (P.yearRead && book.yearRead) {
+    properties[P.yearRead] = { number: Number(book.yearRead) };
   }
 
-  if (optionalProps.yearsRead && book.yearsRead?.length) {
-    properties["Years Read"] = multiSelectProperty(book.yearsRead);
+  if (P.yearsRead && book.yearsRead?.length) {
+    properties[P.yearsRead] = multiSelectProperty(book.yearsRead);
   }
 
-  if (optionalProps.timesRead && book.timesRead) {
-    properties["Times Read"] = {
-      number: Number(book.timesRead),
-    };
+  if (P.timesRead && book.timesRead) {
+    properties[P.timesRead] = { number: Number(book.timesRead) };
   }
 
-  if (optionalProps.storyGraphId && book.id) {
-    properties["StoryGraph ID"] = richTextProperty(book.id);
+  if (P.storyGraphId && book.id) {
+    properties[P.storyGraphId] = richTextProperty(book.id);
   }
 
   return properties;
 }
 
+// ---------------------------------------------------------------------------
+// Existing pages
+//
 // books-read:
 //   Only fill Notion fields that are empty.
 //
 // to-read / currently-reading:
-//   Refresh fields when StoryGraph supplies a value. Do not erase a Notion
-//   value when StoryGraph supplies nothing.
+//   Refresh a field when StoryGraph supplies a usable value AND it differs from
+//   what Notion has. Never erase a value because StoryGraph supplied nothing.
 //
-// Covers:
-//   Always fill-only. Existing page covers and existing Cover Image files are
-//   never overwritten.
-async function buildExistingPageUpdate(book, listType, page, schema) {
-  const existing = page.properties || {};
-  const properties = {};
+// Read-history fields (Year Read, Years Read, Times Read, StoryGraph ID) and
+// covers are always fill-only. Nothing is written when nothing changed.
+// ---------------------------------------------------------------------------
 
+async function buildExistingPageUpdate(book, listType, page) {
   const isReadHistory = listType === "books-read";
+  const properties = {};
   let cover;
 
+  const text = (key) => getPlainText(pv(page, key));
+  const number = (key) => getNumber(pv(page, key));
+  const names = (key) => getMultiSelectNames(pv(page, key));
+
+  // Page cover: fill only if the page has none.
   if (!getPageCoverUrl(page) && validExternalUrl(book.cover)) {
     cover = coverPayload(book.cover);
   }
 
+  // Cover Image property: fill only if empty.
   if (
-    canUse(schema, "Cover Image", "files") &&
-    !hasFilesProperty(existing["Cover Image"]) &&
+    P.coverImage &&
+    !hasFilesProperty(pv(page, "coverImage")) &&
     validExternalUrl(book.cover)
   ) {
-    const coverUpload = await importCoverToNotion(
-      book.cover,
-      book.title
-    );
+    const coverFile = await buildCoverFile(book);
 
-    if (coverUpload) {
-      properties["Cover Image"] = {
-        files: [coverUpload],
-      };
+    if (coverFile) {
+      properties[P.coverImage] = { files: [coverFile] };
     }
   }
 
-  if (
-    canUse(schema, "Author", "rich_text") &&
-    book.author &&
-    (!isReadHistory || !getPlainText(existing.Author))
-  ) {
-    properties.Author = richTextProperty(book.author);
+  if (P.author && hasKnownAuthor(book)) {
+    const current = text("author");
+
+    if (isReadHistory ? !current : clean(book.author) !== current) {
+      properties[P.author] = richTextProperty(book.author);
+    }
   }
 
-  if (
-    canUse(schema, "Status", "select") &&
-    (!isReadHistory || !getSelectName(existing.Status))
-  ) {
-    properties.Status = {
-      select: {
-        name: listTypeToStatus(listType),
-      },
-    };
+  if (P.status) {
+    const current = getSelectName(pv(page, "status"));
+    const wanted = listTypeToStatus(listType);
+
+    if (isReadHistory ? !current : current !== wanted) {
+      properties[P.status] = { select: { name: wanted } };
+    }
   }
 
-  if (
-    canUse(schema, "Rating", "number") &&
-    book.rating !== undefined &&
-    (!isReadHistory || getNumber(existing.Rating) === null)
-  ) {
-    properties.Rating = {
-      number: Number(book.rating),
-    };
+  if (P.rating && book.rating !== undefined) {
+    const current = number("rating");
+
+    if (isReadHistory ? current === null : current !== Number(book.rating)) {
+      properties[P.rating] = { number: Number(book.rating) };
+    }
   }
 
-  if (
-    canUse(schema, "Genres", "multi_select") &&
-    book.genreTags?.length &&
-    (!isReadHistory ||
-      getMultiSelectNames(existing.Genres).length === 0)
-  ) {
-    properties.Genres = multiSelectProperty(book.genreTags.slice(0, 20));
+  if (P.pageCount && book.pageCount) {
+    const current = number("pageCount");
+
+    if (isReadHistory ? current === null : current !== Number(book.pageCount)) {
+      properties[P.pageCount] = { number: Number(book.pageCount) };
+    }
   }
 
-  if (
-    canUse(schema, "Moods", "multi_select") &&
-    book.moodTags?.length &&
-    (!isReadHistory ||
-      getMultiSelectNames(existing.Moods).length === 0)
-  ) {
-    properties.Moods = multiSelectProperty(book.moodTags.slice(0, 20));
+  for (const [key, tags] of [
+    ["genres", book.genreTags],
+    ["moods", book.moodTags],
+  ]) {
+    if (!P[key] || !tags?.length) {
+      continue;
+    }
+
+    const current = names(key);
+    const wanted = tags.slice(0, 20);
+
+    if (isReadHistory ? current.length === 0 : !sameSet(current, wanted)) {
+      properties[P[key]] = multiSelectProperty(wanted);
+    }
   }
 
-  if (
-    canUse(schema, "Page Count", "number") &&
-    book.pageCount &&
-    (!isReadHistory || getNumber(existing["Page Count"]) === null)
-  ) {
-    properties["Page Count"] = {
-      number: Number(book.pageCount),
-    };
+  // Always fill-only.
+  if (P.yearRead && book.yearRead && number("yearRead") === null) {
+    properties[P.yearRead] = { number: Number(book.yearRead) };
   }
 
-  // These read-history values always remain fill-only.
-  if (
-    optionalProps.yearRead &&
-    book.yearRead &&
-    getNumber(existing["Year Read"]) === null
-  ) {
-    properties["Year Read"] = {
-      number: Number(book.yearRead),
-    };
+  if (P.yearsRead && book.yearsRead?.length && names("yearsRead").length === 0) {
+    properties[P.yearsRead] = multiSelectProperty(book.yearsRead);
   }
 
-  if (
-    optionalProps.yearsRead &&
-    book.yearsRead?.length &&
-    getMultiSelectNames(existing["Years Read"]).length === 0
-  ) {
-    properties["Years Read"] = multiSelectProperty(book.yearsRead);
+  if (P.timesRead && book.timesRead && number("timesRead") === null) {
+    properties[P.timesRead] = { number: Number(book.timesRead) };
   }
 
-  if (
-    optionalProps.timesRead &&
-    book.timesRead &&
-    getNumber(existing["Times Read"]) === null
-  ) {
-    properties["Times Read"] = {
-      number: Number(book.timesRead),
-    };
-  }
-
-  if (
-    optionalProps.storyGraphId &&
-    book.id &&
-    !getPlainText(existing["StoryGraph ID"])
-  ) {
-    properties["StoryGraph ID"] = richTextProperty(book.id);
+  if (P.storyGraphId && book.id && !text("storyGraphId")) {
+    properties[P.storyGraphId] = richTextProperty(book.id);
   }
 
   return { properties, cover };
 }
 
-async function saveBook(book, listType, indexes, schema) {
+// For confirmed duplicates, copy only non-destructive data into the canonical
+// page: union Years Read / Genres / Moods, keep the higher Times Read, fill
+// blanks. Nothing is removed from any page, and the duplicates stay untouched.
+// (Times Read is never added up: two duplicate pages may describe the same reads.)
+function applyDuplicateMerge(update, canonical, duplicates) {
+  if (duplicates.length === 0) {
+    return;
+  }
+
+  const values = (page, key) => getMultiSelectNames(pv(page, key));
+
+  for (const key of ["yearsRead", "genres", "moods"]) {
+    if (!P[key]) continue;
+
+    const current = values(canonical, key);
+    const pending = update.properties[P[key]];
+    const base = pending ? pending.multi_select.map((item) => item.name) : current;
+
+    const union = [
+      ...new Set([
+        ...base,
+        ...duplicates.flatMap((duplicate) => values(duplicate, key)),
+      ]),
+    ];
+
+    if (pending || !sameSet(union, current)) {
+      update.properties[P[key]] = multiSelectProperty(
+        key === "yearsRead" ? sortYearNames(union) : union
+      );
+    }
+  }
+
+  if (P.timesRead) {
+    const current = getNumber(pv(canonical, "timesRead"));
+    const pending = update.properties[P.timesRead]?.number;
+    const baseline = pending ?? current ?? 0;
+
+    const highest = Math.max(
+      0,
+      ...duplicates.map((duplicate) => getNumber(pv(duplicate, "timesRead")) ?? 0)
+    );
+
+    if (highest > baseline) {
+      update.properties[P.timesRead] = { number: highest };
+    }
+  }
+
+  const fillBlank = (key, read, write) => {
+    if (!P[key] || update.properties[P[key]]) return;
+
+    const current = read(canonical);
+
+    if (current !== null && current !== "" && current !== undefined) return;
+
+    for (const duplicate of duplicates) {
+      const value = read(duplicate);
+
+      if (value !== null && value !== "" && value !== undefined) {
+        update.properties[P[key]] = write(value);
+        return;
+      }
+    }
+  };
+
+  fillBlank("author", (page) => getPlainText(pv(page, "author")), richTextProperty);
+  fillBlank("storyGraphId", (page) => getPlainText(pv(page, "storyGraphId")), richTextProperty);
+  fillBlank("rating", (page) => getNumber(pv(page, "rating")), (value) => ({ number: value }));
+  fillBlank("pageCount", (page) => getNumber(pv(page, "pageCount")), (value) => ({ number: value }));
+  fillBlank("yearRead", (page) => getNumber(pv(page, "yearRead")), (value) => ({ number: value }));
+
+  // Covers: only external links can be copied safely (Notion-hosted file links expire).
+  if (P.coverImage && !update.properties[P.coverImage] && !hasFilesProperty(pv(canonical, "coverImage"))) {
+    for (const duplicate of duplicates) {
+      const file = pv(duplicate, "coverImage")?.files?.find(
+        (item) => item.type === "external" && item.external?.url
+      );
+
+      if (file) {
+        update.properties[P.coverImage] = {
+          files: [{ type: "external", name: file.name, external: { url: file.external.url } }],
+        };
+        break;
+      }
+    }
+  }
+
+  if (!update.cover && !getPageCoverUrl(canonical)) {
+    const fromDuplicate = duplicates
+      .map((duplicate) => duplicate.cover)
+      .find((item) => item?.type === "external" && item.external?.url);
+
+    if (fromDuplicate) {
+      update.cover = coverPayload(fromDuplicate.external.url);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Saving one book
+// ---------------------------------------------------------------------------
+
+async function saveBook(book, listType, indexes) {
   if (!book?.title || book.title === "Untitled Book") {
     console.log(
       `Skipping entry with missing title (id: ${book?.id || "none"})...`
@@ -814,21 +1013,15 @@ async function saveBook(book, listType, indexes, schema) {
   }
 
   try {
-    const existingPage = findExistingPage(book, indexes);
+    const match = findExistingPage(book, indexes);
 
-    if (!existingPage) {
-      const properties = await createBookProperties(
-        book,
-        listType,
-        schema
-      );
+    if (!match) {
+      const properties = await createBookProperties(book, listType);
 
       const page = await notionRequest(
         () =>
           notion.pages.create({
-            parent: {
-              database_id: databaseId,
-            },
+            parent: { database_id: databaseId },
             ...(validExternalUrl(book.cover)
               ? { cover: coverPayload(book.cover) }
               : {}),
@@ -837,19 +1030,21 @@ async function saveBook(book, listType, indexes, schema) {
         `create "${book.title}"`
       );
 
-      rememberPage(indexes, page);
+      indexPage(indexes, page);
 
       stats.created++;
       console.log(`Added new book: ${book.title}`);
       return;
     }
 
-    const update = await buildExistingPageUpdate(
-      book,
-      listType,
-      existingPage,
-      schema
-    );
+    const { page: existingPage, duplicates } = match;
+
+    reportDuplicates(book, existingPage, duplicates);
+    warnIfAuthorDiffers(book, existingPage);
+
+    const update = await buildExistingPageUpdate(book, listType, existingPage);
+
+    applyDuplicateMerge(update, existingPage, duplicates);
 
     if (Object.keys(update.properties).length === 0 && !update.cover) {
       stats.unchanged++;
@@ -857,7 +1052,7 @@ async function saveBook(book, listType, indexes, schema) {
       return;
     }
 
-    await notionRequest(
+    const updated = await notionRequest(
       () =>
         notion.pages.update({
           page_id: existingPage.id,
@@ -866,6 +1061,9 @@ async function saveBook(book, listType, indexes, schema) {
         }),
       `update "${book.title}"`
     );
+
+    // Keep our copy current, so later lists see what was just written.
+    Object.assign(existingPage, updated);
 
     stats.updated++;
 
@@ -883,6 +1081,10 @@ async function saveBook(book, listType, indexes, schema) {
     stats.failed.push(book.title);
   }
 }
+
+// ---------------------------------------------------------------------------
+// Scraping, logging, and the main routine
+// ---------------------------------------------------------------------------
 
 async function scrapeStoryGraphList({ target, limit }) {
   try {
@@ -949,7 +1151,7 @@ async function syncAllToNotion() {
       );
     }
 
-    const schema = await checkDatabaseProperties();
+    await checkDatabaseProperties();
     const indexes = await loadExistingPages();
 
     // Active lists refresh first. books-read runs last but only fills blanks,
@@ -972,7 +1174,7 @@ async function syncAllToNotion() {
       await enrichBooks(scraped, listType);
       logFieldCounts(listType, scraped);
 
-      const books = mergeRepeatBooks(scraped, listType);
+      const { books, editionMerges } = mergeRepeatBooks(scraped, listType);
 
       if (books.length !== scraped.length) {
         const repeats = books.filter(
@@ -1000,8 +1202,16 @@ async function syncAllToNotion() {
         );
       }
 
+      if (editionMerges.length > 0) {
+        console.log(
+          `[MERGE] Counted as one book because the title AND author are identical ` +
+            `even though StoryGraph IDs differ (probably different editions): ` +
+            editionMerges.join(" | ")
+        );
+      }
+
       for (const book of books) {
-        await saveBook(book, listType, indexes, schema);
+        await saveBook(book, listType, indexes);
       }
     }
 
@@ -1011,7 +1221,7 @@ async function syncAllToNotion() {
       `Summary: ${stats.created} created, ${stats.updated} updated, ` +
         `${stats.unchanged} unchanged, ${stats.skipped} skipped, ` +
         `${stats.failed.length} failed, ${stats.duplicateMatches} ` +
-        "canonical duplicate matches."
+        "duplicate groups need manual review."
     );
 
     if (stats.failed.length > 0) {
