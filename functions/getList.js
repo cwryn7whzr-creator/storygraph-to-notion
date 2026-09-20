@@ -3,26 +3,18 @@ import { chromium } from "playwright";
 import * as cheerio from "cheerio";
 import parseBookPane from "../utils/parseBookPane.js";
 
-// Hardcoded fallback guarantees navigation never hits /undefined or /***
-const FALLBACK_USERNAME = "seaw457";
-const RAW_USERNAME = process.env.USERNAME ? process.env.USERNAME.trim() : "";
-const USERNAME = RAW_USERNAME && RAW_USERNAME !== "***" ? RAW_USERNAME : FALLBACK_USERNAME;
+// Directly hardcode your StoryGraph handle here
+const HARDCODED_USERNAME = "seaw457"; 
 
-const createStorygraphUrl = (target, username) => {
-  const handle = username && username !== "***" ? username : FALLBACK_USERNAME;
-  // Appending ?view=list forces StoryGraph to server-render full book cards on public lists
-  return `https://app.thestorygraph.com/${target}/${handle}?view=list`;
+const createStorygraphUrl = (target) => {
+  return `https://app.thestorygraph.com/${target}/${HARDCODED_USERNAME}`;
 };
 
 const fetchAllBookPanes = async (target, username, limit = Infinity) => {
   const allBookPanes = [];
   const browser = await chromium.launch({
     headless: true,
-    args: [
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      "--disable-blink-features=AutomationControlled",
-    ],
+    args: ["--no-sandbox", "--disable-setuid-sandbox"],
   });
 
   const context = await browser.newContext({
@@ -32,21 +24,21 @@ const fetchAllBookPanes = async (target, username, limit = Infinity) => {
   });
 
   const page = await context.newPage();
-  const url = createStorygraphUrl(target, username);
+  const url = createStorygraphUrl(target); // Uses the hardcoded URL directly
 
   try {
     console.log(`[SCRAPER] Navigating to ${url}...`);
     const response = await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
 
     if (response && response.status() === 404) {
-      console.error(`[SCRAPER] Page 404 at ${url}. Check handle '${username}'.`);
+      console.error(`[SCRAPER] Page returned 404 at ${url}. Check handle.`);
       return [];
     }
 
-    // Wait 3 seconds for initial DOM hydration
+    // Give dynamic client-side scripts time to populate DOM
     await page.waitForTimeout(3000);
 
-    // Scroll to bottom to trigger lazy rendering of card covers and pagination
+    // Scroll down to trigger lazy loading for card covers and pagination
     await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
     await page.waitForTimeout(1000);
 
@@ -54,7 +46,7 @@ const fetchAllBookPanes = async (target, username, limit = Infinity) => {
     let pageCount = 1;
 
     while (hasNextPage && allBookPanes.length < limit) {
-      // Primary card selectors (same ones that successfully captured to-read)
+      // Primary card selectors
       await page
         .waitForSelector(
           ".book-pane, .search-results-item, .book-title-author-and-series, .book-pane-wrapper",
@@ -62,7 +54,7 @@ const fetchAllBookPanes = async (target, username, limit = Infinity) => {
         )
         .catch(() => {});
 
-      // Extract raw HTML card elements
+      // Extract raw card HTML elements
       const paneHtmls = await page.$$eval(         ".book-pane, .search-results-item, .book-pane-wrapper",         (elements) => elements.map((el) => el.outerHTML)       );        let finalPaneHtmls = paneHtmls;       if (finalPaneHtmls.length === 0) {         finalPaneHtmls = await page.$$eval(".book-title-author-and-series", (elements) =>
           elements.map((el) => {
             const parent =
@@ -137,11 +129,10 @@ const fetchAllBookPanes = async (target, username, limit = Infinity) => {
 
 export const handler = async (req) => {
   const target = req.queryStringParameters?.target || "books-read";
-  const username = req.queryStringParameters?.username || USERNAME;
   const limit = req.queryStringParameters?.limit || Infinity;
 
   try {
-    const bookPanes = await fetchAllBookPanes(target, username, limit);
+    const bookPanes = await fetchAllBookPanes(target, HARDCODED_USERNAME, limit);
     const data = bookPanes.map((pane) => parseBookPane(pane));
 
     return {
