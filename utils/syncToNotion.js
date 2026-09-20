@@ -17,19 +17,64 @@ const validCover = (url) =>
 const MAX_RETRIES = 6;
 const stats = { saved: 0, skipped: 0, failed: [], noCover: [] };
 
-// "Year Read" is only sent if the database really has a Number property with that name;
+// These properties are only sent if the database really has them with the right type;
 // otherwise Notion would reject every page.
-let hasYearReadProp = false;
-async function checkYearReadProperty() {
+//   "Years Read" = Multi-select (every year the book was read, rereads included)
+//   "Times Read" = Number       (how many times it was read)
+//   "Year Read"  = Number       (most recent year read; optional)
+const optionalProps = { yearsRead: false, timesRead: false, yearRead: false };
+async function checkOptionalProperties() {
   try {
     const db = await notion.databases.retrieve({ database_id: databaseId });
-    hasYearReadProp = db.properties?.["Year Read"]?.type === "number";
+    const p = db.properties || {};
+    optionalProps.yearsRead = p["Years Read"]?.type === "multi_select";
+    optionalProps.timesRead = p["Times Read"]?.type === "number";
+    optionalProps.yearRead = p["Year Read"]?.type === "number";
   } catch (error) {
     console.warn(`Could not read the database schema: ${error.message}`);
   }
-  if (!hasYearReadProp) {
-    console.warn('No Number property called "Year Read" in the Notion database, so year read will be skipped.');
+  if (!optionalProps.yearsRead) {
+    console.warn('No Multi-select property called "Years Read" in the Notion database, so years read will be skipped.');
   }
+  if (!optionalProps.timesRead) {
+    console.warn('No Number property called "Times Read" in the Notion database, so times read will be skipped.');
+  }
+}
+
+// The list has one entry per READ, so a reread book shows up more than once. Notion has one
+// row per title, so fold repeat entries into one book: every year goes into yearsRead, and
+// timesRead counts the entries. Only books-read gets these; the other lists pass through.
+function mergeRepeatBooks(books, listType) {
+  if (listType !== "books-read") return books;
+
+  const byTitle = new Map();
+  const merged = [];
+  for (const b of books) {
+    if (!b || !b.title || b.title === "Untitled Book") {
+      merged.push(b); // skipped later, same as before
+      continue;
+    }
+    const first = byTitle.get(b.title);
+    if (!first) {
+      const copy = { ...b, timesRead: 1, yearsRead: b.yearRead ? [b.yearRead] : [] };
+      byTitle.set(b.title, copy);
+      merged.push(copy);
+      continue;
+    }
+    first.timesRead++;
+    if (b.yearRead && !first.yearsRead.includes(b.yearRead)) first.yearsRead.push(b.yearRead);
+    // Fill any blanks from the repeat entry (the first entry is the most recent read).
+    for (const key of ["cover", "author", "pageCount", "dateRead", "rating"]) {
+      if (first[key] === undefined || first[key] === null || first[key] === "") {
+        if (b[key] !== undefined && b[key] !== null && b[key] !== "") first[key] = b[key];
+      }
+    }
+  }
+  for (const b of byTitle.values()) {
+    b.yearsRead.sort((x, y) => x - y);
+    b.yearRead = b.yearsRead.length ? b.yearsRead[b.yearsRead.length - 1] : undefined;
+  }
+  return merged;
 }
 
 async function addBookToNotion(book, listType, attempt = 1) {
@@ -127,7 +172,12 @@ async function addBookToNotion(book, listType, attempt = 1) {
             number: Number(book.pageCount),
           }
         : undefined,
-      "Year Read": hasYearReadProp && book.yearRead ? { number: book.yearRead } : undefined,
+      "Year Read": optionalProps.yearRead && book.yearRead ? { number: book.yearRead } : undefined,
+      "Years Read":
+        optionalProps.yearsRead && book.yearsRead?.length
+          ? { multi_select: book.yearsRead.map((y) => ({ name: String(y) })) }
+          : undefined,
+      "Times Read": optionalProps.timesRead && book.timesRead ? { number: book.timesRead } : undefined,
     };
 
     // Remove undefined properties prior to sending to Notion API
@@ -230,7 +280,7 @@ function logFieldCounts(listType, books) {
 async function syncAllToNotion() {
   try {
     console.log("Starting sync to Notion...");
-    await checkYearReadProperty();
+    await checkOptionalProperties();
 
     // Order matters: a book on more than one list keeps the status from the
     // LAST list processed. "Read" goes last so it isn't overwritten by
@@ -239,10 +289,23 @@ async function syncAllToNotion() {
 
     for (const listType of listTypes) {
       console.log(`Fetching ${listType} list...`);
-      const books = await scrapeStoryGraphList({ target: listType });
-      console.log(`Found ${books.length} books in ${listType}`);
-      await enrichBooks(books, listType);
-      logFieldCounts(listType, books);
+      const scraped = await scrapeStoryGraphList({ target: listType });
+      console.log(`Found ${scraped.length} books in ${listType}`);
+      await enrichBooks(scraped, listType);
+      logFieldCounts(listType, scraped);
+
+      const books = mergeRepeatBooks(scraped, listType);
+      if (books.length !== scraped.length) {
+        console.log(`Merged ${scraped.length} entries into ${books.length} titles (repeat reads count toward Times Read).`);
+        const repeats = books.filter((b) => b.timesRead > 1);
+        console.log(
+          `Read more than once (${repeats.length}): ` +
+            repeats
+              .slice(0, 40)
+              .map((b) => `${b.title.slice(0, 50)} (${b.timesRead}x${b.yearsRead.length ? `: ${b.yearsRead.join(", ")}` : ""})`)
+              .join(" | ")
+        );
+      }
 
       for (const book of books) {
         await addBookToNotion(book, listType);
