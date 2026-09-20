@@ -5,7 +5,7 @@ const notion = new Client({
   auth: process.env.NOTION_API_KEY,
 });
 const databaseId = process.env.NOTION_DATABASE_ID;
-const username = process.env.USERNAME;
+const username = process.env.USERNAME || "seaw457";
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -92,7 +92,7 @@ async function addBookToNotion(book, listType) {
         : undefined,
     };
 
-    // Strip undefined properties to ensure valid Notion payloads
+    // Remove undefined fields before sending to Notion API
     Object.keys(bookProperties).forEach(
       (key) => bookProperties[key] === undefined && delete bookProperties[key]
     );
