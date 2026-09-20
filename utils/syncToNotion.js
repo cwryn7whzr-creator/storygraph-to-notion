@@ -8,13 +8,26 @@ const databaseId = process.env.NOTION_DATABASE_ID;
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+// Notion rejects the WHOLE book if the cover URL is not a valid full URL,
+// so only pass through clean https/http links.
+const validCover = (url) =>
+  typeof url === "string" && /^https?:\/\//i.test(url) && url.length < 2000 ? url : null;
+
+const stats = { saved: 0, skipped: 0, failed: [] };
+
 async function addBookToNotion(book, listType) {
   if (!book || !book.title || book.title === "Untitled Book") {
-    console.log("Skipping entry with missing title...");
+    console.log(`Skipping entry with missing title (id: ${book?.id ?? "none"})...`);
+    stats.skipped++;
     return;
   }
 
   try {
+    const cover = validCover(book.cover);
+    if (book.cover && !cover) {
+      console.warn(`Bad cover URL for "${book.title}": ${String(book.cover).slice(0, 100)}`);
+    }
+
     const response = await notion.databases.query({
       database_id: databaseId,
       filter: {
@@ -49,15 +62,14 @@ async function addBookToNotion(book, listType) {
           name: listTypeToStatus(listType),
         },
       },
-      // UPDATED: Truncated file name to satisfy Notion API 100-character limit
-      "Cover Image": book.cover
+      "Cover Image": cover
         ? {
             files: [
               {
                 name: `${book.title || "Book"} Cover`.slice(0, 100),
                 type: "external",
                 external: {
-                  url: book.cover,
+                  url: cover,
                 },
               },
             ],
@@ -106,11 +118,11 @@ async function addBookToNotion(book, listType) {
 
     // Shared payload structure containing page cover and properties
     const pagePayload = {
-      cover: book.cover
+      cover: cover
         ? {
             type: "external",
             external: {
-              url: book.cover,
+              url: cover,
             },
           }
         : undefined,
@@ -131,13 +143,18 @@ async function addBookToNotion(book, listType) {
       });
       console.log(`Added new book: ${book.title}`);
     }
+    stats.saved++;
   } catch (error) {
     if (error.status === 429) {
       console.warn(`Rate limited on "${book.title}". Retrying in 3 seconds...`);
       await delay(3000);
       return addBookToNotion(book, listType);
     }
-    console.error(`Error adding book ${book.title} to Notion:`, error);
+    // Notion's message says exactly which property or value it rejected.
+    console.error(
+      `Error adding book "${book.title}": [${error.code || error.status || "unknown"}] ${error.message}`
+    );
+    stats.failed.push(book.title);
   }
 }
 
@@ -162,6 +179,12 @@ async function scrapeStoryGraphList({ target, limit }) {
         limit,
       },
     });
+
+    // If the scraper reported an error, don't try to treat it as a book list.
+    if (result.statusCode !== 200) {
+      console.error(`Scraper failed for ${target}:`, result.body);
+      return [];
+    }
 
     return JSON.parse(result.body);
   } catch (error) {
@@ -188,6 +211,12 @@ async function syncAllToNotion() {
     }
 
     console.log("Sync to Notion completed!");
+    console.log(
+      `Summary: ${stats.saved} saved, ${stats.skipped} skipped (no title), ${stats.failed.length} failed.`
+    );
+    if (stats.failed.length > 0) {
+      console.log(`Failed books: ${stats.failed.join(" | ")}`);
+    }
   } catch (error) {
     console.error("Error syncing to Notion:", error);
   }
