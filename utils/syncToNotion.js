@@ -73,7 +73,7 @@ async function addBookToNotion(book, listType) {
         book.genreTags && book.genreTags.length > 0
           ? {
               multi_select: book.genreTags
-                .map((tag) => ({ name: tag }))
+                .map((tag) => ({ name: tag.replace(/,/g, "") }))
                 .slice(0, 10),
             }
           : undefined,
@@ -81,7 +81,7 @@ async function addBookToNotion(book, listType) {
         book.moodTags && book.moodTags.length > 0
           ? {
               multi_select: book.moodTags
-                .map((tag) => ({ name: tag }))
+                .map((tag) => ({ name: tag.replace(/,/g, "") }))
                 .slice(0, 10),
             }
           : undefined,
@@ -92,7 +92,6 @@ async function addBookToNotion(book, listType) {
         : undefined,
     };
 
-    // Safely remove undefined fields before calling Notion API
     Object.keys(bookProperties).forEach(
       (key) => bookProperties[key] === undefined && delete bookProperties[key]
     );
