@@ -1,44 +1,46 @@
-name: Storygraph to Notion Sync
+# Changes to make in your workflow file (.github/workflows/<your file>.yml).
+# Only the parts shown change. Everything else in the file stays as it is.
 
 on:
-  push:
-    branches:
-      - main
   schedule:
-    - cron: '0 9 * * *'
+    # Fast run (to-read + currently-reading) three times a week: Monday, Wednesday, Friday.
+    # For every day instead, use "0 13 * * *". The hour is in UTC.
+    - cron: "0 13 * * 1,3,5"
   workflow_dispatch:
+    inputs:
+      mode:
+        description: "active = to-read + currently-reading (fast) | full = also books-read, ratings, years (slow) | cleanup = merge/remove duplicates, fix Times Read and covers (Notion only)"
+        type: choice
+        options:
+          - active
+          - full
+          - cleanup
+        default: active
+      apply:
+        description: "cleanup only: tick to actually make the changes (unticked = preview only)"
+        type: boolean
+        default: false
+      tags:
+        description: "full only: also import moods and genres (slow; they rarely change, so leave unticked most of the time)"
+        type: boolean
+        default: false
+      min_year:
+        description: "cleanup only: remove any Years Read value earlier than this year (StoryGraph has no data before 2018 for this account). Leave empty to keep all years."
+        type: string
+        default: "2018"
 
 jobs:
   deploy:
-    runs-on: ubuntu-latest
-
+    # Cuts off a stuck run instead of letting it burn half an hour.
+    timeout-minutes: 30
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
+      # ... your existing steps (checkout, setup node, install, etc.) stay unchanged ...
 
-    - name: Setup Node.js
-      uses: actions/setup-node@v4
-      with:
-        node-version: '22'
-
-    - name: Install dependencies
-      run: npm install
-
-    - name: Install Playwright Browsers
-      run: npx playwright install chromium --with-deps
-
-    - name: Sync data to Notion
-      run: node utils/syncToNotion.js
-      env:
-        USERNAME: ${{ secrets.USERNAME }}
-        NOTION_API_KEY: ${{ secrets.NOTION_API_KEY }}
-        NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
-        NODE_OPTIONS: --experimental-modules
-
-    - name: Upload debug files
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: scraper-debug
-        path: debug-*
-        if-no-files-found: ignore
+      # Your existing "node utils/syncToNotion.js" step: keep whatever env it already has
+      # (NOTION_API_KEY, NOTION_DATABASE_ID, ...) and add these four lines under env:
+      - run: node utils/syncToNotion.js
+        env:
+          SYNC_MODE: ${{ github.event.inputs.mode || 'active' }}
+          CLEANUP_APPLY: ${{ github.event.inputs.apply || 'false' }}
+          MIN_YEAR_READ: ${{ github.event.inputs.min_year || '' }}
+          ENRICH_TAGS: ${{ github.event.inputs.tags == 'true' && '1' || '' }}
