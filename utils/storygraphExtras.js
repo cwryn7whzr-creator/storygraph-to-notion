@@ -121,7 +121,7 @@ const scrapeUserReviews = async () => {
       }
 
       try {
-        await page.waitForSelector("a[href*='/books/']", { timeout: 10000 });
+        await page.waitForSelector("a[href*='/books/']", { timeout: 10000, state: "attached" });
       } catch {
         console.warn(
           `[REVIEWS] page ${pageNo}: no book links. URL: ${page.url()} | Title: ${await page.title()}`
@@ -234,10 +234,14 @@ export const applyRatings = (books, { byId, byTitle }) => {
 // 2. YEAR READ
 //
 // The public pages don't show read dates, but the public stats page tells us
-// how many books were read in each year ("27 books, 8,205 pages"). The
-// books-read list is ordered newest first, so the first N1 books belong to the
-// latest year, the next N2 to the year before, and so on. Books that failed to
-// scrape are the OLDEST ones, so they don't shift anything above them.
+// how many reads happened in each year ("27 books, 8,205 pages"). The
+// books-read list has one entry per read (a reread is its own entry) and is
+// ordered newest first, so the first N1 entries belong to the latest year, the
+// next N2 to the year before, and so on. Entries left over after the last year
+// with data have no read date on StoryGraph, so they get no year.
+//
+// For a year with no reads at all, StoryGraph shows the ALL-TIME total instead
+// (e.g. 201), so any count at or above the list size is treated as "no data".
 // ---------------------------------------------------------------------------
 
 const readYearCount = async (page) => {
@@ -259,7 +263,7 @@ const readYearCount = async (page) => {
   return m ? Number(m[1].replace(/,/g, "")) : null;
 };
 
-const scrapeYearCounts = async () => {
+const scrapeYearCounts = async (allTimeTotal) => {
   const context = await getContext();
   const page = await context.newPage();
   const counts = new Map(); // year -> books read that year
@@ -278,7 +282,11 @@ const scrapeYearCounts = async () => {
         break;
       }
 
-      const n = status === "ok" ? await readYearCount(page) : null;
+      let n = status === "ok" ? await readYearCount(page) : null;
+      if (n !== null && allTimeTotal && n >= allTimeTotal) {
+        console.log(`[YEARS] ${year}: page shows the all-time total (${n}), so no reads that year.`);
+        n = 0;
+      }
       if (n && n > 0) {
         counts.set(year, n);
         total += n;
@@ -312,8 +320,8 @@ export const assignYearsByPosition = (books, counts) => {
 };
 
 let yearCountsPromise = null;
-const getYearCounts = () => {
-  yearCountsPromise ??= scrapeYearCounts().catch((err) => {
+const getYearCounts = (allTimeTotal) => {
+  yearCountsPromise ??= scrapeYearCounts(allTimeTotal).catch((err) => {
     console.error("[YEARS] Failed, continuing without year read:", err.message);
     return new Map();
   });
@@ -332,7 +340,7 @@ export const enrichBooks = async (books, listType) => {
 
   if (listType !== "books-read") return;
 
-  const counts = await getYearCounts();
+  const counts = await getYearCounts(books.length);
   if (counts.size === 0) {
     console.warn("[YEARS] No yearly counts found, so Year Read will be left empty.");
     return;
@@ -345,18 +353,19 @@ export const enrichBooks = async (books, listType) => {
   for (const s of spans) {
     console.log(`[YEARS] ${s.year}: ${s.count} books, from "${s.first}" to "${s.last}"`);
   }
-  console.log(`[YEARS] assigned a year to ${assigned} of ${books.length} books.`);
+  console.log(`[YEARS] assigned a year to ${assigned} of ${books.length} entries.`);
 
   if (statsTotal > books.length) {
     console.warn(
-      `[YEARS] Stats count ${statsTotal} reads but only ${books.length} books were scraped. ` +
-        `If the difference is the books that failed to scrape, this is fine. If it is re-reads, ` +
-        `years for older books may be off.`
+      `[YEARS] Stats count ${statsTotal} reads but only ${books.length} list entries were scraped, ` +
+        `so some reads are missing from the list and older years may be off.`
     );
   } else if (statsTotal < books.length) {
     console.warn(
-      `[YEARS] Stats count ${statsTotal} reads but ${books.length} books were scraped, ` +
-        `so the oldest ${books.length - statsTotal} have no year (probably no read date on StoryGraph).`
+      `[YEARS] Stats count ${statsTotal} reads but the list has ${books.length} entries, ` +
+        `so the oldest ${books.length - statsTotal} entries have no year (probably no read date on StoryGraph).`
     );
+  } else {
+    console.log(`[YEARS] Stats total (${statsTotal}) matches the list (${books.length} entries).`);
   }
 };
