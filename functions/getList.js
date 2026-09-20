@@ -4,8 +4,9 @@ import { chromium } from "playwright";
 import * as cheerio from "cheerio";
 import parseBookPane from "../utils/parseBookPane.js";
 
-const HARDCODED_USERNAME = "seaw457";
-const BASE = "https://app.thestorygraph.com";
+export const HARDCODED_USERNAME = "seaw457";
+export const BASE = "https://app.thestorygraph.com";
+const PAGE_SIZE = 10; // pages/scroll batches hold 10 books (page 2 started 10 in, page 3 started 20 in, ...)
 const MAX_PAGES = 200; // safety cap so a bad selector can never loop forever
 const MAX_SCROLL_ROUNDS = 80; // safety cap on infinite-scroll loading per page
 const MAX_EMPTY_PAGES_IN_A_ROW = 3; // tolerate a few pages that add nothing before giving up
@@ -36,7 +37,7 @@ const pause = (baseMs) => new Promise((r) => setTimeout(r, baseMs + Math.random(
 let sharedBrowser = null;
 let sharedContext = null;
 
-const getContext = async () => {
+export const getContext = async () => {
   if (sharedContext) return sharedContext;
 
   const launchOptions = {
@@ -84,10 +85,11 @@ export const closeBrowser = async () => {
 // Opens a URL and, if Cloudflare shows "Just a moment...", waits for it to
 // clear. Retries up to 3x. Returns "ok", "404" or "blocked".
 // ---------------------------------------------------------------------------
-const openPage = async (page, url, label) => {
+export const openPage = async (page, url, label) => {
   for (let attempt = 1; attempt <= 3; attempt++) {
     const response = await page.goto(url, { waitUntil: "domcontentloaded", timeout: 35000 });
     if (response && response.status() === 404) return "404";
+    if (response && response.status() >= 400) console.warn(`[SCRAPER] ${label}: HTTP ${response.status()}`);
 
     let title = await page.title().catch(() => "Just a moment...");
 
@@ -143,12 +145,14 @@ const countBookLinks = (page) =>
 // Keep scrolling to the bottom until the number of books stops growing (or we
 // reach the expected total), then make sure the cover images have loaded.
 // ---------------------------------------------------------------------------
-const loadEverythingOnPage = async (page, expectedTotal, label) => {
+export const loadEverythingOnPage = async (page, expectedTotal, label) => {
   let last = await countBookLinks(page);
   let stable = 0;
   let rounds = 0;
 
-  while (rounds < MAX_SCROLL_ROUNDS && stable < 3) {
+  // While still short of the expected total, wait longer: later batches load slower.
+  const patience = () => (expectedTotal && last < expectedTotal ? 6 : 3);
+  while (rounds < MAX_SCROLL_ROUNDS && stable < patience()) {
     rounds++;
     await page.evaluate(async () => {
       for (let y = window.scrollY; y < document.body.scrollHeight; y += 500) {
@@ -157,7 +161,7 @@ const loadEverythingOnPage = async (page, expectedTotal, label) => {
       }
       window.scrollTo(0, document.body.scrollHeight);
     });
-    await page.waitForTimeout(1500);
+    await page.waitForTimeout(expectedTotal && last < expectedTotal ? 2500 : 1500);
 
     const now = await countBookLinks(page);
     if (now > last) {
@@ -237,7 +241,13 @@ const scrapeSource = async (page, source, limit) => {
         fs.writeFileSync(`debug-${tag}.html`, await page.content());
         console.warn(`[SCRAPER] ${tag}: saved debug-${tag}.png and debug-${tag}.html`);
       }
-      break;
+      if (pageCount === 1 || !expectedTotal) break;
+      // A tail page that fails to render shouldn't end the whole list; try the next one.
+      emptyStreak++;
+      if (emptyStreak >= MAX_EMPTY_PAGES_IN_A_ROW || pageCount >= Math.ceil(expectedTotal / PAGE_SIZE) + 1) break;
+      pageCount++;
+      await pause(2500);
+      continue;
     }
 
     // 3. Learn how many books the list should have (first time only).
@@ -326,6 +336,9 @@ const scrapeSource = async (page, source, limit) => {
       }
     }
 
+    // Diagnostic: if cards > unique books, the list has repeat entries (e.g. rereads) that get merged below.
+    console.log(`[SCRAPER] ${tag}: page ${pageCount} had ${cards.length} cards, ${new Set(cards.map((c) => c.id)).size} unique books.`);
+
     // 6. Merge into the Map. Count only genuinely new books.
     let added = 0;
     for (const { id, html } of cards) {
@@ -347,10 +360,14 @@ const scrapeSource = async (page, source, limit) => {
       hasNextPage = false; // we have everything Storygraph says exists
     } else {
       emptyStreak = added === 0 ? emptyStreak + 1 : 0;
-      if (emptyStreak >= MAX_EMPTY_PAGES_IN_A_ROW) {
+      const lastPage = expectedTotal ? Math.ceil(expectedTotal / PAGE_SIZE) + 1 : MAX_PAGES;
+      if (emptyStreak >= MAX_EMPTY_PAGES_IN_A_ROW || pageCount >= lastPage) {
         hasNextPage = false;
       } else {
-        pageCount++;
+        // ?page=N starts N-1 pages in and then scrolls to the same stopping point every time,
+        // so walking 2, 3, 4... only re-reads books we already have. From page 1, jump straight
+        // to the page holding the first book we're still missing.
+        pageCount = pageCount === 1 ? Math.max(2, Math.floor(books.size / PAGE_SIZE) + 1) : pageCount + 1;
         await pause(2500); // slower, slightly random pacing looks less like a bot
       }
     }
