@@ -1,86 +1,108 @@
-let hasNextPage = true;
-    let pageCount = 1;
+import * as cheerio from "cheerio";
+import fs from "fs";
 
-    while (hasNextPage && allBookPanes.length < limit) {
-      // 1. If we are beyond page 1, navigate directly to the page URL
-      if (pageCount > 1) {
-        const pageUrl = `${url}?page=${pageCount}`;
-        console.log(`[SCRAPER] Navigating to Page ${pageCount}: ${pageUrl}...`);
-        await page.goto(pageUrl, { waitUntil: "domcontentloaded", timeout: 35000 });
-        await page.waitForTimeout(2000);
-      }
+const MAX_PAGES = 200; // safety cap so a bad selector can never loop forever
+const PAGE_DELAY_MS = 1500; // be polite to avoid throttling
 
-      // 2. Incremental smooth scroll to force lazy-loaded images to hydrate
-      await page.evaluate(async () => {
-        for (let i = 0; i < document.body.scrollHeight; i += 300) {
-          window.scrollTo(0, i);
-          await new Promise((res) => setTimeout(res, 50));
-        }
-      });
-      await page.waitForTimeout(1000);
+/**
+ * Scrape a Storygraph list (read, to-read, currently-reading).
+ *
+ * @param {import("playwright").Page} page  Authenticated Playwright page
+ * @param {string} url                      Base list URL (may already contain a query string)
+ * @param {string} target                   "read" | "to-read" | "currently-reading"
+ * @param {number} limit                    Max books to return (default: no limit)
+ * @returns {Promise<Array>}                Array of cheerio roots, one per book card
+ */
+export async function getList(page, url, target, limit = Infinity) {
+  const allBookPanes = [];
+  const seenIds = new Set();
+  let hasNextPage = true;
+  let pageCount = 1;
 
-      // 3. Extract book cards on current page
-      const cardSelector = target === "currently-reading"
-        ? ".currently-reading-cover-wrapper, .currently-reading-title-author, div:has(> a[href*='/books/'])"
-        : ".book-pane, .search-results-item, .book-pane-wrapper, .book-title-author-and-series";
+  const cardSelector =
+    target === "currently-reading"
+      ? ".currently-reading-cover-wrapper, .currently-reading-title-author"
+      : ".book-pane";
 
-      await page.waitForSelector(cardSelector, { timeout: 10000 }).catch(() => {});
+  while (hasNextPage && allBookPanes.length < limit && pageCount <= MAX_PAGES) {
+    // 1. Navigate (page 1 uses the base URL, later pages add ?page=N safely)
+    const u = new URL(url);
+    if (pageCount > 1) u.searchParams.set("page", String(pageCount));
+    console.log(`[SCRAPER] ${target}: navigating to page ${pageCount}: ${u}`);
+    await page.goto(u.toString(), { waitUntil: "domcontentloaded", timeout: 35000 });
 
-      const paneHtmls = await page.$$eval(cardSelector, (elements, tgt) =>
-        elements
-          .map((el) => {
-            let card;
-            if (tgt === "currently-reading") {
-              card = el.closest(".currently-reading-cover-wrapper") || 
-                     el.closest(".currently-reading-title-author") || 
-                     el.closest(".flex-col") || 
-                     el;
-            } else {
-              card = el.closest(".book-pane") ||
-                     el.closest(".search-results-item") ||
-                     el.closest(".book-pane-wrapper") ||
-                     el;
-            }
-            return card ? card.outerHTML : "";
-          })
-          .filter(Boolean),
-        target
+    // 2. Wait for cards, but never fail silently
+    try {
+      await page.waitForSelector(cardSelector, { timeout: 10000 });
+    } catch {
+      console.warn(
+        `[SCRAPER] ${target}: no cards on page ${pageCount}. ` +
+          `URL: ${page.url()} | Title: ${await page.title()}`
       );
-
-      const uniquePanes = [...new Set(paneHtmls)].filter(Boolean);
-      console.log(`[SCRAPER] Page ${pageCount}: Found ${uniquePanes.length} books in ${target}.`);
-
-      // If no cards found on this page, we've reached the end
-      if (uniquePanes.length === 0) {
-        console.log(`[SCRAPER] No more books found. Finished scraping ${target}.`);
-        hasNextPage = false;
-        break;
+      if (pageCount === 1) {
+        // Page 1 empty = selector, login, or bot-block problem. Save evidence.
+        await page.screenshot({ path: `debug-${target}.png`, fullPage: true });
+        fs.writeFileSync(`debug-${target}.html`, await page.content());
+        console.warn(`[SCRAPER] ${target}: saved debug-${target}.png and debug-${target}.html`);
       }
-
-      for (const html of uniquePanes) {
-        if (allBookPanes.length < limit) {
-          const $ = cheerio.load(html);
-          allBookPanes.push($.root());
-        }
-      }
-
-      // Profile page (currently-reading) only has 1 page
-      if (target === "currently-reading") {
-        hasNextPage = false;
-        break;
-      }
-
-      // 4. Check if a 'Next' link exists in the DOM to know if another page exists
-      const hasNextLink = await page.evaluate(() => {
-        const nextEl = document.querySelector(".pagination .next a, a[rel='next'], a.next_page, .pagination a:has-text('Next')");
-        if (!nextEl) return false;
-        return !nextEl.classList.contains("disabled") && nextEl.getAttribute("aria-disabled") !== "true";
-      });
-
-      if (hasNextLink && allBookPanes.length < limit) {
-        pageCount++;
-      } else {
-        console.log(`[SCRAPER] Reached last page (${pageCount}) for ${target}.`);
-        hasNextPage = false;
-      }
+      break;
     }
+
+    // 3. Scroll to trigger lazy-loaded images
+    await page.evaluate(async () => {
+      for (let i = 0; i < document.body.scrollHeight; i += 300) {
+        window.scrollTo(0, i);
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      window.scrollTo(0, 0);
+    });
+    await page.waitForTimeout(500);
+
+    // 4. Extract cards. Also promote lazy-load attributes to src so the
+    //    captured HTML has real image URLs, not placeholders.
+    const cards = await page.$$eval(cardSelector, (els) =>
+      els.map((el) => {
+        const card = el.closest(".book-pane") || el.closest(".flex-col") || el;
+
+        card.querySelectorAll("img").forEach((img) => {
+          const lazy =
+            img.getAttribute("data-src") ||
+            img.getAttribute("data-lazy-src") ||
+            img.getAttribute("data-original");
+          if (lazy && (!img.src || img.src.startsWith("data:"))) {
+            img.setAttribute("src", lazy);
+          }
+        });
+
+        const href = card.querySelector("a[href*='/books/']")?.getAttribute("href") || null;
+        return { id: href, html: card.outerHTML };
+      })
+    );
+
+    // 5. De-dupe by book link (not by HTML) and add to results
+    let added = 0;
+    for (const { id, html } of cards) {
+      if (!id || seenIds.has(id)) continue;
+      if (allBookPanes.length >= limit) break;
+      seenIds.add(id);
+      allBookPanes.push(cheerio.load(html).root());
+      added++;
+    }
+
+    console.log(
+      `[SCRAPER] ${target}: page ${pageCount} added ${added} new books ` +
+        `(${allBookPanes.length} total).`
+    );
+
+    // 6. Stop when a page adds nothing new, or when there's no pagination
+    if (added === 0 || target === "currently-reading") {
+      hasNextPage = false;
+    } else {
+      pageCount++;
+      await page.waitForTimeout(PAGE_DELAY_MS);
+    }
+  }
+
+  console.log(`[SCRAPER] ${target}: finished with ${allBookPanes.length} books.`);
+  return allBookPanes;
+}
