@@ -49,12 +49,20 @@ async function addBookToNotion(book, listType) {
           name: listTypeToStatus(listType),
         },
       },
-      "Cover Image":
-        book.cover
-          ? {
-              url: book.cover,
-            }
-          : undefined,
+      // UPDATED: Formatted as a Notion "Files & Media" property
+      "Cover Image": book.cover
+        ? {
+            files: [
+              {
+                name: `${book.title || "Book"} Cover`,
+                type: "external",
+                external: {
+                  url: book.cover,
+                },
+              },
+            ],
+          }
+        : undefined,
       "Date Read": book.dateRead
         ? {
             date: {
@@ -91,21 +99,35 @@ async function addBookToNotion(book, listType) {
         : undefined,
     };
 
+    // Remove undefined properties prior to sending to Notion API
     Object.keys(bookProperties).forEach(
       (key) => bookProperties[key] === undefined && delete bookProperties[key]
     );
+
+    // Shared payload structure containing page cover and properties
+    const pagePayload = {
+      cover: book.cover
+        ? {
+            type: "external",
+            external: {
+              url: book.cover,
+            },
+          }
+        : undefined,
+      properties: bookProperties,
+    };
 
     if (response.results.length > 0) {
       const pageId = response.results[0].id;
       await notion.pages.update({
         page_id: pageId,
-        properties: bookProperties,
+        ...pagePayload,
       });
       console.log(`Updated book: ${book.title}`);
     } else {
       await notion.pages.create({
         parent: { database_id: databaseId },
-        properties: bookProperties,
+        ...pagePayload,
       });
       console.log(`Added new book: ${book.title}`);
     }
