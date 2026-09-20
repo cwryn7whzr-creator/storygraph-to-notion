@@ -1,5 +1,6 @@
 import { Client } from "@notionhq/client";
 import * as scraper from "../functions/getList.js";
+import { enrichBooks } from "./storygraphExtras.js";
 
 const notion = new Client({
   auth: process.env.NOTION_API_KEY,
@@ -15,6 +16,21 @@ const validCover = (url) =>
 
 const MAX_RETRIES = 6;
 const stats = { saved: 0, skipped: 0, failed: [], noCover: [] };
+
+// "Year Read" is only sent if the database really has a Number property with that name;
+// otherwise Notion would reject every page.
+let hasYearReadProp = false;
+async function checkYearReadProperty() {
+  try {
+    const db = await notion.databases.retrieve({ database_id: databaseId });
+    hasYearReadProp = db.properties?.["Year Read"]?.type === "number";
+  } catch (error) {
+    console.warn(`Could not read the database schema: ${error.message}`);
+  }
+  if (!hasYearReadProp) {
+    console.warn('No Number property called "Year Read" in the Notion database, so year read will be skipped.');
+  }
+}
 
 async function addBookToNotion(book, listType, attempt = 1) {
   if (!book || !book.title || book.title === "Untitled Book") {
@@ -111,6 +127,7 @@ async function addBookToNotion(book, listType, attempt = 1) {
             number: Number(book.pageCount),
           }
         : undefined,
+      "Year Read": hasYearReadProp && book.yearRead ? { number: book.yearRead } : undefined,
     };
 
     // Remove undefined properties prior to sending to Notion API
@@ -206,13 +223,14 @@ function logFieldCounts(listType, books) {
     `[FIELDS] ${listType}: ${books.length} books | cover ${n((b) => b.cover)} | ` +
       `rating ${n((b) => b.rating !== undefined)} | dateRead ${n((b) => b.dateRead)} | ` +
       `genres ${n((b) => b.genreTags?.length)} | moods ${n((b) => b.moodTags?.length)} | ` +
-      `pageCount ${n((b) => b.pageCount)}`
+      `pageCount ${n((b) => b.pageCount)} | yearRead ${n((b) => b.yearRead)}`
   );
 }
 
 async function syncAllToNotion() {
   try {
     console.log("Starting sync to Notion...");
+    await checkYearReadProperty();
 
     // Order matters: a book on more than one list keeps the status from the
     // LAST list processed. "Read" goes last so it isn't overwritten by
@@ -223,6 +241,7 @@ async function syncAllToNotion() {
       console.log(`Fetching ${listType} list...`);
       const books = await scrapeStoryGraphList({ target: listType });
       console.log(`Found ${books.length} books in ${listType}`);
+      await enrichBooks(books, listType);
       logFieldCounts(listType, books);
 
       for (const book of books) {
