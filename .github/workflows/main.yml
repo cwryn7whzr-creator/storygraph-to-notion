@@ -34,3 +34,11 @@ jobs:
         NOTION_API_KEY: ${{ secrets.NOTION_API_KEY }}
         NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
         NODE_OPTIONS: --experimental-modules
+
+    - name: Upload debug files
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: scraper-debug
+        path: debug-*
+        if-no-files-found: ignore
