@@ -21,8 +21,7 @@ const clean = (value) => String(value || "").replace(/\s+/g, " ").trim();
 
 const MAX_RETRIES = 6;
 
-// Keep below Notion's practical 3-request-per-second integration rate.
-// 450ms = about 2.2 requests/second maximum from this script.
+// This is deliberately below Notion's average integration request capacity.
 const NOTION_MIN_INTERVAL_MS = 450;
 
 const stats = {
@@ -35,8 +34,6 @@ const stats = {
   noYear: [],
 };
 
-// These are optional so the script does not fail if you have not added them
-// to your Notion database yet.
 const optionalProps = {
   yearsRead: false,
   timesRead: false,
@@ -46,7 +43,6 @@ const optionalProps = {
 
 let lastNotionRequestAt = 0;
 
-// Routes every Notion request through a single pacing and retry layer.
 async function notionRequest(fn, label, attempt = 1) {
   const waitMs = Math.max(
     0,
@@ -94,7 +90,9 @@ async function notionRequest(fn, label, attempt = 1) {
 }
 
 function getPlainText(property) {
-  if (!property) return "";
+  if (!property) {
+    return "";
+  }
 
   if (property.type === "title" || property.type === "rich_text") {
     return clean(
@@ -128,10 +126,15 @@ function getMultiSelectNames(property) {
 }
 
 function getExternalFileUrl(property) {
-  if (property?.type !== "files") return null;
+  if (property?.type !== "files") {
+    return null;
+  }
 
   const file = property.files?.[0];
-  if (!file) return null;
+
+  if (!file) {
+    return null;
+  }
 
   if (file.type === "external") {
     return file.external?.url || null;
@@ -229,12 +232,12 @@ function canUse(schema, propertyName, expectedType) {
 }
 
 async function checkDatabaseProperties() {
-  const db = await notionRequest(
+  const database = await notionRequest(
     () => notion.databases.retrieve({ database_id: databaseId }),
     "database schema retrieval"
   );
 
-  const schema = db.properties || {};
+  const schema = database.properties || {};
 
   optionalProps.yearsRead =
     schema["Years Read"]?.type === "multi_select";
@@ -292,7 +295,8 @@ async function checkDatabaseProperties() {
   return schema;
 }
 
-// Loads all existing pages once. This avoids one database query per book.
+// Fetch the database once, then match StoryGraph entries in memory by exact
+// title. This removes about one Notion query call per book.
 async function loadExistingPages() {
   const byExactTitle = new Map();
   let cursor = undefined;
@@ -318,7 +322,7 @@ async function loadExistingPages() {
       if (byExactTitle.has(title)) {
         console.warn(
           `[NOTION] Duplicate existing title "${title}". ` +
-            "The first matching page will be used; duplicates are not merged automatically."
+            "The first page will be used; duplicate pages are not merged automatically."
         );
         continue;
       }
@@ -336,9 +340,8 @@ async function loadExistingPages() {
   return byExactTitle;
 }
 
-// The StoryGraph books-read list contains one item per completed read.
-// A reread may therefore appear more than once. Keep one Notion page per
-// exact display title while accumulating Times Read and Years Read.
+// Keep your intentional rereads. The list contains one StoryGraph entry for
+// each completed read, while Notion has one page per exact displayed title.
 function mergeRepeatBooks(books, listType) {
   if (listType !== "books-read") {
     return books;
@@ -373,7 +376,6 @@ function mergeRepeatBooks(books, listType) {
       first.yearsRead.push(book.yearRead);
     }
 
-    // Preserve the first / newest entry's display values and fill blanks only.
     for (const key of [
       "cover",
       "author",
@@ -417,7 +419,8 @@ function mergeRepeatBooks(books, listType) {
   return merged;
 }
 
-// Used only when creating a new Notion page.
+// Used when creating a new Notion page. New pages get all available
+// StoryGraph information, including the same cover URL twice.
 function createBookProperties(book, listType, schema) {
   const cover = validCover(book.cover);
 
@@ -499,15 +502,14 @@ function createBookProperties(book, listType, schema) {
 }
 
 // books-read:
-//   Fill blank values only. Never replace an existing Notion property.
+//   Fill blank fields only. Do not replace values already in Notion.
 //
 // to-read / currently-reading:
-//   Refresh any field StoryGraph actually provides. Do not erase a Notion value
-//   when StoryGraph gives no value.
+//   Refresh values when StoryGraph provides a value. Do not clear a field when
+//   StoryGraph returns no value.
 //
-// Covers are always fill-only for every list so manually selected covers remain
-// protected. If one location is blank, it copies from the other location or
-// from StoryGraph's source cover.
+// Covers:
+//   Always fill-only for all lists to protect your manual Notion cover work.
 function buildExistingPageUpdate(book, listType, existingPage, schema) {
   const existing = existingPage.properties || {};
   const properties = {};
@@ -521,8 +523,8 @@ function buildExistingPageUpdate(book, listType, existingPage, schema) {
   const isReadHistory = listType === "books-read";
   let cover;
 
-  // Cover Image Files & media property:
-  // Never replace it if it already exists. Fill only when blank.
+  // Cover Image property stays protected. Fill a blank property from an
+  // existing page cover first, otherwise use StoryGraph's source cover.
   if (
     canUse(schema, "Cover Image", "files") &&
     !existingCoverProperty
@@ -534,8 +536,8 @@ function buildExistingPageUpdate(book, listType, existingPage, schema) {
     }
   }
 
-  // Page cover:
-  // Never replace it if it already exists. Fill only when blank.
+  // Page cover stays protected. Fill a blank page cover from the existing
+  // Files & media URL first, otherwise use StoryGraph's source cover.
   if (!existingPageCover) {
     const fillPageCover = sourceCover || existingCoverProperty;
 
@@ -544,9 +546,6 @@ function buildExistingPageUpdate(book, listType, existingPage, schema) {
     }
   }
 
-  // Author:
-  // Read history = fill blank only.
-  // Active lists = update if StoryGraph has an author.
   if (
     canUse(schema, "Author", "rich_text") &&
     book.author &&
@@ -555,9 +554,6 @@ function buildExistingPageUpdate(book, listType, existingPage, schema) {
     properties.Author = richTextProperty(book.author);
   }
 
-  // Status:
-  // Read history = fill blank only.
-  // Active lists = always track the list being synced.
   if (
     canUse(schema, "Status", "select") &&
     (!isReadHistory || !getSelectName(existing.Status))
@@ -620,8 +616,8 @@ function buildExistingPageUpdate(book, listType, existingPage, schema) {
     };
   }
 
-  // These are your intentional historic read-tracking fields.
-  // They remain fill-only regardless of list type.
+  // Historic read-tracking fields remain fill-only, preserving any Notion
+  // adjustments you have made to years or count.
   if (
     optionalProps.yearRead &&
     book.yearRead &&
@@ -650,7 +646,8 @@ function buildExistingPageUpdate(book, listType, existingPage, schema) {
     };
   }
 
-  // Diagnostic only. Never overwrite an existing StoryGraph ID.
+  // Useful as a non-destructive source identifier for diagnostics. It never
+  // changes a populated Notion ID.
   if (
     optionalProps.storyGraphId &&
     book.id &&
@@ -667,6 +664,7 @@ async function saveBook(book, listType, existingPages, schema) {
     console.log(
       `Skipping entry with missing title (id: ${book?.id || "none"})...`
     );
+
     stats.skipped++;
     return;
   }
@@ -730,7 +728,7 @@ async function saveBook(book, listType, existingPages, schema) {
         }),
       listType === "books-read"
         ? `fill read-history blanks for "${book.title}"`
-        : `sync active-list values for "${book.title}"`
+        : `sync active-list fields for "${book.title}"`
     );
 
     existingPages.set(book.title, page);
@@ -767,7 +765,10 @@ async function scrapeStoryGraphList({ target, limit }) {
 
     return JSON.parse(result.body);
   } catch (error) {
-    console.error(`Error scraping list ${target}: ${error.message}`);
+    console.error(
+      `Error scraping list ${target}: ${error.message}`
+    );
+
     return [];
   }
 }
@@ -817,9 +818,8 @@ async function syncAllToNotion() {
     const schema = await checkDatabaseProperties();
     const existingPages = await loadExistingPages();
 
-    // This ordering is intentional. Active-list statuses are refreshed first.
-    // books-read goes last but does not overwrite a populated status, because
-    // read history uses fill-only behavior.
+    // Active lists update first. Read history is last but only fills blanks,
+    // so it cannot overwrite an existing active-list status.
     const listTypes = [
       "to-read",
       "currently-reading",
@@ -841,7 +841,9 @@ async function syncAllToNotion() {
       const books = mergeRepeatBooks(scraped, listType);
 
       if (books.length !== scraped.length) {
-        const repeats = books.filter((book) => book.timesRead > 1);
+        const repeats = books.filter(
+          (book) => book.timesRead > 1
+        );
 
         console.log(
           `Merged ${scraped.length} entries into ${books.length} titles ` +
