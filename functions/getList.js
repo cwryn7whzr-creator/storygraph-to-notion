@@ -5,14 +5,21 @@ import parseBookPane from "../utils/parseBookPane.js";
 
 const USERNAME = process.env.USERNAME || "seaw457";
 
-const createStorygraphUrl = (target, username) =>
-  `https://app.thestorygraph.com/${target}/${username}`;
+// StoryGraph public reading list URL builder
+const createStorygraphUrl = (target, username) => {
+  const cleanUser = username ? username.trim().replace(/^\/+|\/+$/g, "") : "seaw457";
+  return `https://app.thestorygraph.com/${target}/${cleanUser}`;
+};
 
 const fetchAllBookPanes = async (target, username, limit = Infinity) => {
   const allBookPanes = [];
   const browser = await chromium.launch({
     headless: true,
-    args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-blink-features=AutomationControlled"],
+    args: [
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-blink-features=AutomationControlled",
+    ],
   });
 
   const context = await browser.newContext({
@@ -29,30 +36,35 @@ const fetchAllBookPanes = async (target, username, limit = Infinity) => {
 
   try {
     console.log(`[SCRAPER] Navigating to ${url}...`);
-    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 35000 });
+    const response = await page.goto(url, { waitUntil: "domcontentloaded", timeout: 35000 });
+
+    if (response && response.status() === 404) {
+      console.error(`[SCRAPER] Error: Page returned 404. Check if USERNAME '${username}' is correct.`);
+      return [];
+    }
 
     let hasNextPage = true;
     let pageCount = 1;
 
     while (hasNextPage && allBookPanes.length < limit) {
-      // 1. Give dynamic Turbo frames time to attach content
-      await page.waitForTimeout(2500);
+      // Allow dynamic Turbo elements to attach
+      await page.waitForTimeout(3000);
 
-      // 2. Multi-stage scroll to force lazy loading images & elements
+      // Scroll to trigger lazy loading
       await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight / 2));
       await page.waitForTimeout(500);
       await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
       await page.waitForTimeout(1000);
 
-      // 3. Multi-selector targeting all possible card representations
+      // Multi-selector covering all StoryGraph layout variations
       const cardSelector =
         ".book-pane, .search-results-item, .book-pane-wrapper, .book-title-author-and-series, [data-controller*='book-pane']";
 
       await page
-        .waitForSelector(cardSelector, { timeout: 15000 })
-        .catch(() => console.log(`[SCRAPER] Container selector timeout on page ${pageCount}. Attempting direct DOM evaluation.`));
+        .waitForSelector(cardSelector, { timeout: 10000 })
+        .catch(() => console.log(`[SCRAPER] Container selector timeout on page ${pageCount}`));
 
-      // 4. Extract card HTML blocks safely
+      // Extract HTML blocks directly from DOM
       const paneHtmls = await page.$$eval(cardSelector, (elements) =>
         elements
           .map((el) => {
@@ -81,7 +93,7 @@ const fetchAllBookPanes = async (target, username, limit = Infinity) => {
         }
       }
 
-      // 5. Multi-strategy selector for pagination
+      // Pagination controls matching
       const paginationSelector =
         ".pagination .next a:not(.disabled), .pagination a[rel='next']:not(.disabled), a.next_page:not(.disabled), [aria-label*='next' i]:not(.disabled)";
 
